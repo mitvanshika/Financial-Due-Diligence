@@ -291,11 +291,20 @@ def get_structured_facts(query: str, cfg: Config | None = None) -> list[dict]:
 
 def describe_fact(fact: dict) -> str:
     """One line describing a fact, shared by Layer 4's grader and Layer 5's
-    answer prompt so both see the number described the same way."""
-    value = fact["value"]
-    number = f"{value:,.0f}" if float(value).is_integer() else f"{value:,.2f}"
+    answer prompt so both see the number described the same way.
+
+    Dollar amounts are written in millions, as the 10-K's own tables are:
+    the passages beside these facts say "112,010" for net income, and the
+    same number written as 112,010,000,000 invited 1000x slips.
+    """
+    value = float(fact["value"])
+    size = abs(value)
+    if "per share" in fact["label"]:
+        amount = f"${size:,.2f} per share"
+    elif size % 1e6 == 0:
+        amount = f"${size / 1e6:,.0f} million"
+    else:  # not a whole number of millions - write it out rather than round it
+        amount = f"${size:,.0f}"
+    sign = "-" if value < 0 else ""
     table = fact["table"].replace("_", " ")
-    return (
-        f"{fact['label']}, fiscal year {fact['year']}: {number} "
-        f"(US dollars unless the label says otherwise; from Apple's {table})"
-    )
+    return f"{fact['label']}, fiscal year {fact['year']}: {sign}{amount} (from Apple's {table})"

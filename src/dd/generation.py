@@ -98,7 +98,7 @@ Evidence:
 Rules:
 - Every factual claim must end with the marker of the evidence it comes \
 from, like [1] or [S1]. Use only markers that appear above. This applies \
-even to a one-number answer, e.g. "$73,733,000,000 [S1]".
+even to a one-number answer, e.g. "$73,733 million [S1]".
 - Also list every marker you used in "citations", e.g. ["[S1]"].
 - If financial statement data [S#] is provided, use it for every number in \
 your answer, and show the numbers a comparison or trend rests on.

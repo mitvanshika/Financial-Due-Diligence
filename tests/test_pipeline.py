@@ -25,6 +25,7 @@ import dd.generation as gen
 import dd.self_healing as sh
 from dd.config import get_config
 from dd.models import Chunk, RetrievedChunk
+from dd.structured import describe_fact
 
 CFG = get_config().self_healing
 
@@ -195,6 +196,10 @@ def test_the_grader_gets_the_scale_headings_and_whole_passage_rule(world):
     for score in (CFG.strong_chunk_threshold, CFG.relevance_threshold, CFG.give_up_below):
         assert f"\n{score:g} - " in prompt
     assert "WHOLE passage" in prompt
+    # Figures have their own scale: sharing the passages' one, each figure of a
+    # comparison was graded 0.5, "one of several things asked for".
+    assert "Figures, on this scale instead:" in prompt
+    assert "company-wide total is not a figure for one product or segment" in prompt
 
 
 def test_grades_are_matched_by_marker_not_position(world):
@@ -352,6 +357,24 @@ def test_differences_of_passage_numbers_are_allowed(world):
         "answer": "Net sales fell from $37,005 in 2024 to $35,686 in 2025, a decrease of $1,319 [1]."}))
     a = gen.answer("Why did Wearables net sales decrease?")
     assert _no_number_warning(a)
+
+
+@pytest.mark.parametrize("label, value, table, written", [
+    ("Net income", 112_010e6, "income_statement", "$112,010 million"),
+    ("Diluted (in dollars per share)", 7.46, "income_statement", "$7.46 per share"),
+    ("Cash used in financing activities", -120_686e6, "cash_flow", "-$120,686 million"),
+    ("Odd amount", 1_234_567.0, "balance_sheet", "$1,234,567"),
+])
+def test_database_figures_are_described_in_millions_like_the_filing(label, value, table, written):
+    assert describe_fact(fact(label, value, table)).startswith(f"{label}, fiscal year 2025: {written} (from")
+
+
+def test_an_answer_in_millions_matches_the_stored_value(world):
+    world([passages("a1", 0.1)], facts=[fact("Net income", 112_010e6)],
+          groq=FakeGroq(fact_grades={"Net income": 0.9}, answer={
+              "answerable": True, "citations": ["[S1]"], "answer": "Net income was $112,010 million [S1]."}))
+    a = gen.answer("net income FY2025?")
+    assert _no_number_warning(a) and a.confidence.band == "high"
 
 
 def test_a_wrong_number_is_still_caught(world):
