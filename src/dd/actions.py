@@ -22,8 +22,11 @@ cited, so an action can never rest on evidence the answer didn't have.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +35,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 from .config import DATA_DIR, Config, get_config
+from .generation import _build_evidence, _clean_facts, _unverified_numbers
 from .models import Answer
 from .self_healing import get_groq_client
 
@@ -54,16 +58,73 @@ def _now() -> str:
 
 
 def _load_json(path: Path) -> list[dict]:
+    """The records in a file. A missing or empty file (a crash can leave a
+    0-byte one) means no records yet. A file that is not valid JSON is an
+    error that names the file: guessing "no records" would let the next save
+    overwrite whatever is in it."""
     if not path.exists():
         return []
-    return json.loads(path.read_text(encoding="utf-8"))
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        return []
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path} is not valid JSON ({exc}); it was left untouched - fix or move it") from exc
+
+
+@contextlib.contextmanager
+def _locked(path: Path, timeout: float = 10.0, stale_after: float = 30.0):
+    """One writer at a time per records file. The CLI and the room can both
+    save to the same file; without this, both read the old list and the
+    second save silently erases the first one's entry."""
+    lock = path.with_name(path.name + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))  # fails if it exists
+            break
+        except FileExistsError:
+            try:
+                if time.time() - lock.stat().st_mtime > stale_after:
+                    lock.unlink(missing_ok=True)  # left behind by a writer that crashed
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"{lock} is held by another writer; if none is running, delete it")
+            time.sleep(0.01)
+    try:
+        yield
+    finally:
+        try:
+            lock.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _append_json(path: Path, entry: dict) -> None:
-    rows = _load_json(path)
-    rows.append(entry)
+    with _locked(path):
+        rows = _load_json(path)
+        rows.append(entry)
+        _write_json(path, rows)
+
+
+def _write_json(path: Path, rows: list[dict]) -> None:
+    """Save the records. Written to a temporary file first and swapped in, so
+    a crash mid-write leaves the old records intact, never half a file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _answer_problems(answer: Answer) -> list[str]:
@@ -82,6 +143,20 @@ def _citation_problems(markers: list[str], answer: Answer) -> list[str]:
     return [f"cites sources the answer doesn't have: {', '.join(invented)}"] if invented else []
 
 
+def _number_problems(text: str, answer: Answer) -> list[str]:
+    """Layer 5 refuses to show a number that matches nothing the answer cites.
+    An action must not be a way around that: a checklist item or memo can only
+    state numbers the answer's own sources support (same check, same limits).
+    An answer with no retrieval record (never the case for a real one) can't
+    be checked."""
+    if answer.outcome is None:
+        return []
+    _, lookup = _build_evidence(answer.outcome.relevant_chunks, _clean_facts(answer.outcome))
+    cited = [lookup[c.marker] for c in answer.citations if c.marker in lookup]
+    bad = _unverified_numbers(text, cited)
+    return [f"number(s) not found in the answer's cited sources: {', '.join(bad)}"] if bad else []
+
+
 def _sources(markers: list[str], answer: Answer) -> list[dict]:
     by_marker = {c.marker: c for c in answer.citations}
     return [
@@ -98,15 +173,27 @@ def _confidence(answer: Answer) -> dict | None:
 def _ask_json(prompt: str, name: str, schema: dict, cfg: Config) -> str:
     """One call to the small model, forced into a JSON shape (same pattern
     as Layer 4's grader). Returns the raw JSON text for a Pydantic model."""
-    resp = get_groq_client(cfg).chat.completions.create(
-        model=cfg.generation.utility_model,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=cfg.generation.utility_max_tokens,
-        temperature=0.0,
-        reasoning_effort=cfg.generation.utility_effort,
-        response_format={"type": "json_schema", "json_schema": {"name": name, "schema": schema}},
-    )
-    return resp.choices[0].message.content
+    client = get_groq_client(cfg)
+    # The model sometimes writes JSON Groq rejects (400 "json_validate_failed").
+    # At temperature 0 it repeats the same mistake, so the one retry uses 0.5.
+    for temperature in (0.0, 0.5):
+        try:
+            resp = client.chat.completions.create(
+                model=cfg.generation.utility_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=cfg.generation.utility_max_tokens,
+                temperature=temperature,
+                reasoning_effort=cfg.generation.utility_effort,
+                response_format={"type": "json_schema", "json_schema": {"name": name, "schema": schema}},
+            )
+            return resp.choices[0].message.content
+        except Exception as exc:  # noqa: BLE001
+            if temperature == 0.5 or not _is_broken_json(exc):
+                raise
+
+
+def _is_broken_json(exc: Exception) -> bool:
+    return getattr(exc, "status_code", None) == 400 and "json_validate_failed" in str(exc)
 
 
 def _source_list(answer: Answer) -> str:
@@ -164,7 +251,8 @@ Write:
 - title: a short name for the issue (under 100 characters)
 - severity: low, medium or high, for how much this matters to an investor
 - summary: two or three short sentences, under 400 characters in total, \
-using only facts from the answer
+using only facts from the answer, with numbers written exactly as the answer \
+writes them
 - citations: the markers from the list above that the summary relies on"""
 
 
@@ -180,6 +268,7 @@ def validate_checklist_item(item: ChecklistItem, answer: Answer) -> list[str]:
     """Every rule that fails, in plain words. Empty list = allowed to go on
     to approval. All problems at once, so a person sees the full picture."""
     problems = _answer_problems(answer) + _citation_problems(item.citations, answer)
+    problems += _number_problems(f"{item.title} {item.summary}", answer)
     existing = {e["title"].strip().lower() for e in _load_json(CHECKLIST_PATH)}
     if item.title.strip().lower() in existing:
         problems.append(f"an item titled '{item.title}' is already on the checklist")
@@ -250,6 +339,26 @@ def execute_flag(flag: ReviewFlag, answer: Answer) -> str:
     return f"flagged {entry['id']} in {REVIEW_QUEUE_PATH}"
 
 
+def open_flags() -> list[dict]:
+    """Review flags still waiting for a reviewer."""
+    return [e for e in _load_json(REVIEW_QUEUE_PATH) if e["status"] == "open"]
+
+
+def close_flag(flag_id: str, note: str = "") -> str:
+    """A reviewer has looked at it. Until a flag is closed, its question can't
+    be flagged again (see validate_flag)."""
+    with _locked(REVIEW_QUEUE_PATH):
+        rows = _load_json(REVIEW_QUEUE_PATH)
+        for entry in rows:
+            if entry["id"] == flag_id:
+                if entry["status"] != "open":
+                    raise ValueError(f"flag {flag_id} is already {entry['status']}")
+                entry.update(status="closed", closed_at=_now(), closed_note=note)
+                _write_json(REVIEW_QUEUE_PATH, rows)
+                return f"closed {flag_id}"
+    raise ValueError(f"no open flag with id {flag_id}")
+
+
 # --- action 3: risk memo ------------------------------------------------------
 
 
@@ -278,7 +387,8 @@ Sources the answer cites:
 Write:
 - title: a short title for the memo (under 100 characters)
 - body: 2 to 4 paragraphs separated by a blank line, under 2000 characters in \
-total. Use only facts from the answer. EVERY paragraph must end with the \
+total. Use only facts from the answer, with numbers written exactly as the \
+answer writes them. EVERY paragraph must end with the \
 marker(s) of its source, written exactly as in the list above, e.g. [1] or [S1]."""
 
 
@@ -305,6 +415,7 @@ def validate_memo(memo: RiskMemo, answer: Answer) -> list[str]:
         if not _MARKER_RE.search(p):
             problems.append(f"paragraph {n} cites no source")
     problems += _citation_problems(_MARKER_RE.findall(memo.body), answer)
+    problems += _number_problems(f"{memo.title} {memo.body}", answer)
     return problems
 
 
