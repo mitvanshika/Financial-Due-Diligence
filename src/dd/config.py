@@ -66,6 +66,7 @@ class ChunkingCfg(BaseModel):
     overlap_chars: int = 150
     min_chars: int = 120
     max_chars: int = 2000
+    table_max_chars: int = 1000
     exclude_items: list[str] = Field(default_factory=lambda: ["Item 15"])
 
 

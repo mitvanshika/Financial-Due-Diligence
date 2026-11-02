@@ -25,6 +25,22 @@ _BOX_RANGE = chr(0x2500) + "-" + chr(0x257F)
 TABLE_RULE_RE = re.compile("[" + _BOX_RANGE + "]{3,}|_{6,}")
 COLUMN_GAP_RE = re.compile(r"\S {3,}\S")
 
+# "(In millions, except number of shares, which are reflected in thousands...)"
+# under a statement's title: the unit of every number in the table below.
+UNITS_RE = re.compile(r"^\((?:dollars |amounts )?in (?:millions|thousands|billions)\b.*\)$", re.I)
+
+# A table cell that is a number: 35,934  (14,264)  $7.46  —  12%
+NUMERIC_CELL_RE = re.compile(r"^[$()\-—–\d,.%]+$")
+
+# A table's column header is its leading rows with no row label and number:
+# "Years ended" / "September 27, | September 28," / "2025 | 2024". Capped so a
+# table made only of words doesn't turn wholly into header.
+MAX_HEADER_ROWS = 5
+
+# The sentence leading into a note table ("...were as follows (in millions):")
+# is what says what its numbers are. Longer than this, it isn't a lead-in.
+MAX_LEAD_IN_CHARS = 300
+
 # Sentence boundary for splitting paragraphs that exceed the target size on
 # their own. Avoids breaking on "U.S." or "Inc." by requiring a following
 # capital or quote and a preceding lowercase/digit/closing punctuation.
@@ -35,10 +51,11 @@ MAX_HEADING_CHARS = 130
 
 @dataclass
 class Block:
-    """One structural unit of the filing: a paragraph, a heading, or a table."""
+    """One structural unit of the filing: a paragraph, a table, or the units
+    line under a statement's title."""
 
     text: str
-    kind: str  # "prose" | "table"
+    kind: str  # "prose" | "table" | "units"
     part: str
     item: str
     section: str
@@ -139,10 +156,22 @@ def parse_blocks(text: str) -> list[Block]:
         buf = []
         buf_kind = "prose"
 
+    def table_follows(i: int) -> bool:
+        """Is the next non-blank line a table line?"""
+        for j in range(i + 1, min(i + 6, len(lines))):
+            if lines[j].strip():
+                return _is_table_line(lines[j])
+        return False
+
     for i in range(start, len(lines)):
         line = lines[i]
         stripped = line.strip()
 
+        # A blank line inside a table is layout, not the table's end: the
+        # statements put blank lines between their date and year rows, and
+        # ending the table there left its rows without their years.
+        if not stripped and buf and buf_kind == "table":
+            continue
         if not stripped or FOOTER_RE.match(stripped):
             flush()
             continue
@@ -160,7 +189,18 @@ def parse_blocks(text: str) -> list[Block]:
             subsection = ""
             continue
 
-        kind = "table" if _is_table_line(line) else "prose"
+        if UNITS_RE.match(stripped) and not line[:1].isspace():
+            flush()
+            blocks.append(Block(text=stripped, kind="units", part=part, item=item, section=section,
+                                subsection=subsection, char_start=offsets[i],
+                                char_end=offsets[i] + len(line)))
+            continue
+
+        # Indented lines in or just before a table are its labels and column
+        # headings ("Current assets:", "Years ended"), not prose: as prose they
+        # cut the balance sheet into five pieces, none with its title or years.
+        part_of_table = line[:1].isspace() and ((buf and buf_kind == "table") or table_follows(i))
+        kind = "table" if _is_table_line(line) or part_of_table else "prose"
 
         if kind == "prose" and _is_heading(line):
             flush()
@@ -217,41 +257,96 @@ def _split_long(text: str, target: int, overlap: int) -> list[str]:
     return out
 
 
-def _split_table(text: str, max_chars: int, title: str = "") -> list[str]:
-    """Row-split an oversized table, repeating its header on every piece.
+def _clean_row(line: str) -> str:
+    """One table row as text: rules dropped, "$" joined to its number, the
+    run of spaces between columns cut to " | ". The filing pads columns with
+    long runs of spaces - 18% of all indexed text was padding, sent to Groq
+    in every prompt and blurring the table's match in search."""
+    line = TABLE_RULE_RE.sub(" ", line).strip()
+    line = re.sub(r"\$\s+", "$", line)
+    return " | ".join(cell for cell in re.split(r"\s{3,}", line) if cell)
 
-    A table has to be split on line boundaries or numbers get separated from
-    their row labels. Repeating the header means each piece still says which
-    fiscal years its columns belong to - without that, a retrieved fragment
-    reads "34,550  10%" with no way to know what either number is.
+
+def _cells(row: str) -> list[str]:
+    return row.split(" | ")
+
+
+def _has_number(row: str) -> bool:
+    return any(NUMERIC_CELL_RE.match(c) for c in _cells(row)[1:])
+
+
+def _is_body_row(row: str) -> bool:
+    """A labelled row ("Total assets | $359,241 | $364,980") or a section
+    label ("Current assets:"), as opposed to column headings."""
+    return bool(re.search(r"[A-Za-z]", _cells(row)[0])) and (row.endswith(":") or _has_number(row))
+
+
+def _starts_section(rows: list[str], i: int) -> bool:
+    """rows[i] is a label with no numbers: "Investing activities:", "ASSETS:"."""
+    return not _has_number(rows[i]) and re.search(r"[A-Za-z]", rows[i]) is not None
+
+
+def _closes_section(rows: list[str], i: int) -> bool:
+    """A cut before rows[i] falls between two of the statement's own parts:
+    after a total ("Total assets", "Cash generated by operating activities")
+    or at an all-capitals label ("LIABILITIES AND SHAREHOLDERS' EQUITY:")."""
+    before = _cells(rows[i - 1])[0].lower()
+    return rows[i].isupper() or before.startswith("total") or "activities" in before
+
+
+def _split_table(header: list[str], rows: list[str], budget: int) -> list[str]:
+    """Rows into pieces of at most `budget` characters, each starting with
+    the header, so every piece says which statement, unit and year its
+    numbers belong to - without that, a piece reads "Diluted | 15,004,697 |
+    15,408,095 | 15,812,547" and an answer took FY2023's figure as FY2025's.
+
+    Cut where the table's own parts meet when one fits (after "Total
+    liabilities", before "Financing activities:"), else at any section label,
+    else between any two rows: never inside a row.
     """
-    lines = text.split("\n")
-    # Header = leading lines up to and including the column rule. Only lines
-    # above that rule are a real header; if the block has no rule (it is
-    # already a continuation of a table split elsewhere), fabricating one from
-    # the first data row would repeat a number as if it were a label, so fall
-    # back to the table's title instead.
-    header_end = 0
-    for i, line in enumerate(lines[:4]):
-        if TABLE_RULE_RE.search(line):
-            header_end = i + 1
-            break
-    header = lines[:header_end] if header_end else ([title] if title else [])
-    header_len = sum(len(h) + 1 for h in header)
-    budget = max(max_chars - header_len, max_chars // 2)
+    room = max(budget - sum(len(h) + 1 for h in header), budget // 2)
+
+    def size(a: int, b: int) -> int:
+        return sum(len(r) + 1 for r in rows[a:b])
 
     pieces: list[str] = []
-    cur: list[str] = []
-    size = 0
-    for line in lines[header_end:]:
-        if size + len(line) + 1 > budget and cur:
-            pieces.append("\n".join(header + cur))
-            cur, size = [], 0
-        cur.append(line)
-        size += len(line) + 1
-    if cur:
-        pieces.append("\n".join(header + cur))
-    return pieces or [text]
+    start = 0
+    while start < len(rows):
+        if size(start, len(rows)) <= room:
+            end = len(rows)
+        else:
+            fits = [e for e in range(start + 1, len(rows)) if size(start, e) <= room] or [start + 1]
+            sections = [e for e in fits if _starts_section(rows, e)]
+            parts = [e for e in sections if _closes_section(rows, e)]
+            end = (parts or sections or fits)[-1]
+        pieces.append("\n".join(header + rows[start:end]))
+        start = end
+    return pieces
+
+
+def _table_context(table: Block, before: Block | None, units: Block | None) -> list[str]:
+    """What a table is, from the lines around it: its heading ("CONSOLIDATED
+    BALANCE SHEETS"), the units line under that heading, and the sentence
+    leading into it ("...were as follows (in millions):")."""
+    lines = [table.subsection or table.section]
+    here = (table.item, table.subsection)
+    if units is not None and (units.item, units.subsection) == here:
+        lines.append(units.text)
+    if before is not None and before.kind == "prose" and (before.item, before.subsection) == here:
+        lead = SENTENCE_RE.split(before.text)[-1].strip()
+        if lead.endswith(":") and len(lead) <= MAX_LEAD_IN_CHARS:
+            lines.append(lead)
+    return [line for line in lines if line]
+
+
+def _table_pieces(table: Block, context: list[str], budget: int) -> list[str]:
+    rows = [r for r in (_clean_row(line) for line in table.text.split("\n")) if r]
+    n_head = 0
+    while n_head < min(len(rows), MAX_HEADER_ROWS) and not _is_body_row(rows[n_head]):
+        n_head += 1
+    if n_head == len(rows):  # a table of words: nothing to repeat but its context
+        n_head = 0
+    return _split_table(context + rows[:n_head], rows[n_head:], budget)
 
 
 def chunk_blocks(blocks: list[Block], cfg: ChunkingCfg) -> list[tuple[str, Block]]:
@@ -263,6 +358,8 @@ def chunk_blocks(blocks: list[Block], cfg: ChunkingCfg) -> list[tuple[str, Block
     out: list[tuple[str, Block]] = []
     cur: list[Block] = []
     size = 0
+    units: Block | None = None   # the last units line, for the table below it
+    before: Block | None = None  # the block just before this one
 
     def flush_group() -> None:
         nonlocal cur, size
@@ -279,17 +376,21 @@ def chunk_blocks(blocks: list[Block], cfg: ChunkingCfg) -> list[tuple[str, Block
             flush_group()
             continue
 
-        # Tables are never packed with prose. They are only split when they
-        # exceed the embedding model's real input limit, and then by row.
+        if block.kind == "units":
+            units = block
+            continue
+
+        # Tables are never packed with prose. A table is one piece if it fits
+        # the models' input with room for the question, otherwise split at
+        # its own section breaks - every piece carrying the table's context.
         if block.kind == "table":
             flush_group()
-            if len(block.text) > cfg.max_chars:
-                title = block.subsection or block.section
-                for piece in _split_table(block.text, cfg.max_chars, title):
-                    out.append((piece, block))
-            else:
-                out.append((block.text, block))
+            context = _table_context(block, before, units)
+            for piece in _table_pieces(block, context, cfg.table_max_chars):
+                out.append((piece, block))
+            units, before = None, block
             continue
+        before = block
 
         same_section = bool(cur) and (
             cur[0].item == block.item and cur[0].subsection == block.subsection
