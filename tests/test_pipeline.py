@@ -25,7 +25,7 @@ import dd.generation as gen
 import dd.self_healing as sh
 from dd.config import get_config
 from dd.models import Chunk, RetrievedChunk
-from dd.structured import describe_fact
+from dd.structured import describe_fact, match_structured_query
 
 CFG = get_config().self_healing
 
@@ -348,15 +348,51 @@ def test_figures_restated_in_millions_are_recognised(world):
     assert _no_number_warning(a) and a.confidence.band == "high"
 
 
-def test_differences_of_passage_numbers_are_allowed(world):
+WEARABLES_TABLE = ("(in millions) Wearables, Home and Accessories $ 35,686 (4)% $ 37,005 "
+                   "Diluted earnings per share $ 7.46 $ 6.08 grade=0.9")
+
+
+def _answer_from_table(world, answer: str):
     p = passages("a1", 0.9, 0.9)
     # "grade=0.9" is what the fake grader reads, so the passage stays relevant.
-    p[0].chunk.text = "Wearables, Home and Accessories net sales were $35,686 in 2025 and $37,005 in 2024. grade=0.9"
-    world([p], groq=FakeGroq(answer={
-        "answerable": True, "citations": ["[1]"],
-        "answer": "Net sales fell from $37,005 in 2024 to $35,686 in 2025, a decrease of $1,319 [1]."}))
-    a = gen.answer("Why did Wearables net sales decrease?")
+    p[0].chunk.text = WEARABLES_TABLE
+    world([p], groq=FakeGroq(answer={"answerable": True, "citations": ["[1]"], "answer": answer}))
+    return gen.answer("Why did Wearables net sales decrease?")
+
+
+def test_differences_of_passage_numbers_are_allowed(world):
+    a = _answer_from_table(world, "Net sales fell from $37,005 million in 2024 to $35,686 million in 2025, "
+                                  "a decrease of $1,319 million [1].")
     assert _no_number_warning(a)
+
+
+@pytest.mark.parametrize("answer", [
+    "Net sales were $35,686M in 2025 [1].",
+    "Net sales were $35.686 billion in 2025 [1].",
+    "Net sales were 35,686 in 2025, in millions [1].",  # a bare table cell, no $
+    "Diluted EPS was $7.46 [1].",                        # per-share amounts are dollars as written
+])
+def test_amounts_from_a_table_in_millions_pass_with_their_unit(world, answer):
+    assert _no_number_warning(_answer_from_table(world, answer))
+
+
+@pytest.mark.parametrize("answer", [
+    "Net sales were $35,686 in 2025 [1].",
+    "Net sales fell by $1,319 [1].",
+])
+def test_a_dollar_amount_that_lost_its_millions_is_caught(world, answer):
+    """A real answer said Greater China net sales were "$64,377" at HIGH: the
+    table's digits, but read as $64 thousand instead of $64 billion."""
+    a = _answer_from_table(world, answer)
+    assert not _no_number_warning(a) and a.confidence.band == "low"
+
+
+def test_a_database_figure_without_its_millions_is_caught(world):
+    world([passages("a1", 0.1)], facts=[fact("Net income", 112_010e6)],
+          groq=FakeGroq(fact_grades={"Net income": 0.9}, answer={
+              "answerable": True, "citations": ["[S1]"], "answer": "Net income was $112,010 [S1]."}))
+    a = gen.answer("net income FY2025?")
+    assert not _no_number_warning(a) and a.confidence.band == "low"
 
 
 @pytest.mark.parametrize("label, value, table, written", [
@@ -367,6 +403,47 @@ def test_differences_of_passage_numbers_are_allowed(world):
 ])
 def test_database_figures_are_described_in_millions_like_the_filing(label, value, table, written):
     assert describe_fact(fact(label, value, table)).startswith(f"{label}, fiscal year 2025: {written} (from")
+
+
+@pytest.mark.parametrize("question, labels", [
+    # A measure limited to one product or region isn't in the database.
+    ("What was Apple's iPhone gross margin in FY2025?", []),
+    ("What was iPhone's operating income in FY2025?", []),
+    ("What was the gross margin for the iPhone in FY2025?", []),
+    ("iPhone gross margin", []),  # the fuzzy pass must not fetch it instead
+    ("What was Products gross margin in FY2025?", []),
+    ("What was Greater China net sales in FY2025?", []),
+    # ...wherever in the question the product or region is.
+    ("How much gross margin did the iPhone make in FY2025?", []),
+    ("What did Japan contribute to operating income in FY2025?", []),
+    # A product's row is its net sales: only the company-wide total goes.
+    ("What were Services net sales in FY2025?", ["Services"]),
+    ("What were net sales of the iPhone in FY2025?", ["iPhone"]),
+    # Asked about separately, both figures are wanted.
+    ("What were iPhone revenue and gross margin in FY2025?", ["iPhone", "Gross margin"]),
+    ("Did net income grow faster than iPhone revenue from FY2024 to FY2025?", ["Net income", "iPhone"]),
+    ("How did iPhone sales compare with net income in FY2025?", ["iPhone", "Net income"]),
+    ("What was iPhone revenue as a share of net sales in FY2025?", ["iPhone", "Net sales"]),
+    ("What was Apple's gross margin in FY2025?", ["Gross margin"]),
+])
+def test_a_measure_limited_to_one_product_or_region_fetches_no_company_figure(question, labels):
+    found = list(dict.fromkeys(m.label for m in match_structured_query(question)))
+    assert found == labels
+
+
+@pytest.mark.parametrize("question, labels", [
+    ("What was iPhone's revenue in FY2025?", ["iPhone"]),
+    ("What was iPhone’s revenue in FY2025?", ["iPhone"]),
+    ("How much did iPhones bring in for FY2025?", ["iPhone"]),
+    ("What was Mac's revenue in FY2025?", ["Mac"]),
+    ("How much did Apple spend on stock buybacks in FY2025?", ["Repurchases of common stock"]),
+    ("What macroeconomic risks does Apple disclose?", []),  # still whole words only
+])
+def test_possessives_and_plurals_match_their_figure(question, labels):
+    """"iPhone's" becomes "iphones" once apostrophes are removed, which the
+    whole-word match for "iphone" used to miss - so no figure was fetched."""
+    found = list(dict.fromkeys(m.label for m in match_structured_query(question)))
+    assert found == labels
 
 
 def test_an_answer_in_millions_matches_the_stored_value(world):

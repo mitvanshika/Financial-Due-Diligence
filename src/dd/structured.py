@@ -68,6 +68,23 @@ AMBIGUOUS_LABEL_CONCEPT_HINTS: dict[str, str] = {
 }
 
 
+# The database's measures are company-wide; for a product line it holds only
+# net sales, and for a region nothing. "iPhone gross margin" must not fetch
+# Gross margin: the number is real, so nothing later would flag it as the
+# answer to a different question.
+_SEGMENT_LABELS = {"iPhone", "Mac", "iPad", "Wearables, Home and Accessories", "Services"}
+_SEGMENT = (
+    r"(?:iphone|mac|ipad|wearables|accessories|services|products"
+    r"|americas|europe|greater china|japan|rest of asia pacific)s?"
+)
+_SEGMENT_RE = re.compile(r"\b" + _SEGMENT + r"\b")
+_SEGMENT_BEFORE_RE = re.compile(r"\b" + _SEGMENT + r"$")
+_SEGMENT_AFTER_RE = re.compile(r"\s+(?:of|for|on|from|in|by)\s+(?:the\s+|apples\s+)?(" + _SEGMENT + r")\b")
+# "iphone revenue", "iphone sales": the product's own net sales, which the
+# database has. Any other mention makes it what the question is about.
+_SALES_AFTER_RE = re.compile(r"\s+(?:revenue|net sales|sales)\b")
+
+
 def _normalize(text: str) -> str:
     """Lowercase, strip, and remove apostrophes of every kind (smart or
     plain). The keywords are written without apostrophes, so "shareholders'
@@ -119,6 +136,23 @@ def _with_years(table: str, label: str, via: str, years: list[str]) -> list[Stru
     return [StructuredMatch(table, label, via, y) for y in years] or [StructuredMatch(table, label, via, None)]
 
 
+def _segment_scope(q: str, start: int, end: int) -> tuple[int, int] | None:
+    """Where the product or region limiting the measure at q[start:end] sits,
+    if one does: "iphone gross margin", "gross margin for the iphone"."""
+    if m := _SEGMENT_BEFORE_RE.search(q[:start].rstrip()):
+        return m.span()
+    if m := _SEGMENT_AFTER_RE.match(q, end):
+        return m.span(1)
+    return None
+
+
+def _segment_mentions(q: str) -> list[tuple[int, int]]:
+    """Products or regions the question is about: "how much gross margin did
+    the iphone make". Not "iphone revenue", which asks for the product's
+    own net sales."""
+    return [m.span() for m in _SEGMENT_RE.finditer(q) if not _SALES_AFTER_RE.match(q, m.end())]
+
+
 def match_structured_query(query: str, fuzzy_cutoff: float = 0.72) -> list[StructuredMatch]:
     """Map a question to every known (table, label) it mentions, times every
     year it states. "Services vs iPhone revenue, FY2024 to FY2025" -> 4 matches.
@@ -131,12 +165,14 @@ def match_structured_query(query: str, fuzzy_cutoff: float = 0.72) -> list[Struc
     years = _extract_years(query)
 
     # Whole words only: a plain substring check let "mac" match inside
-    # "macroeconomic". Record where each keyword sits in the question.
+    # "macroeconomic". One trailing "s" is allowed, because _normalize turns
+    # "iPhone's" into "iphones" and plurals ("stock buybacks") are common.
+    # Record where each keyword sits in the question.
     hits: list[tuple[int, int, str, str]] = []  # (start, end, table, label)
     for table, entries in CANONICAL_LABELS.items():
         for label, keywords in entries:
             for kw in keywords:
-                for m in re.finditer(r"\b" + re.escape(kw) + r"\b", q):
+                for m in re.finditer(r"\b" + re.escape(kw) + r"s?\b", q):
                     hits.append((m.start(), m.end(), table, label))
 
     # Drop a hit that sits inside a longer one: in "diluted earnings per
@@ -147,7 +183,28 @@ def match_structured_query(query: str, fuzzy_cutoff: float = 0.72) -> list[Struc
         if not any(o[0] <= h[0] and h[1] <= o[1] and o[1] - o[0] > h[1] - h[0] for o in hits)
     ]
 
-    if kept:
+    # A measure limited to one product or region isn't in the database. Drop
+    # it, and the product too: iPhone revenue doesn't answer iPhone gross
+    # margin. Net sales is the exception, because a product's row IS its net
+    # sales, so only the company-wide total goes - and only when the product
+    # is right beside it: "iPhone's share of net sales" needs the total.
+    mentions = _segment_mentions(q)
+    for h in [h for h in kept if h[3] not in _SEGMENT_LABELS]:
+        scope = _segment_scope(q, h[0], h[1])
+        if h[3] == "Net sales":
+            if scope:
+                kept.remove(h)
+            continue
+        # Anywhere in the question counts, not just beside the measure: a
+        # wrong figure answers a different question, a missing one is refused.
+        spans = [scope] if scope else mentions
+        if spans and h in kept:
+            kept.remove(h)
+            kept = [o for o in kept if not any(o[0] < e and s < o[1] for s, e in spans)]
+
+    # Checks hits, not kept: with everything dropped above, the fuzzy pass
+    # below would fetch the same company-wide figure again.
+    if hits:
         labels = list(dict.fromkeys((t, lab) for _, _, t, lab in sorted(kept)))  # question order
         return [m for t, lab in labels for m in _with_years(t, lab, "keyword", years)]
 

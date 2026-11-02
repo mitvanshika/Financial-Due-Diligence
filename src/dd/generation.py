@@ -186,13 +186,13 @@ def _check_citations(
 
 # --- Step 4: check the numbers ----------------------------------------------
 
-# A number, optionally with $ in front and million/billion/% after. Not
-# preceded by a letter or digit, so "FY2025", "Q2" and "[S1]" aren't read
-# as numbers.
+# A number, optionally with $ in front and million/billion/% after ("M" and
+# "B" too: "$112,887M"). Not preceded by a letter or digit, so "FY2025", "Q2"
+# and "[S1]" aren't read as numbers.
 _NUM_RE = re.compile(
-    r"(?<![A-Za-z\d.,])(\$?)(\d[\d,]*(?:\.\d+)?)\s*(million|billion|%)?", re.IGNORECASE
+    r"(?<![A-Za-z\d.,])(\$?)(\d[\d,]*(?:\.\d+)?)\s*(million|billion|bn\b|[mb]\b|%)?", re.IGNORECASE
 )
-_SCALE = {"million": 1e6, "billion": 1e9}
+_SCALE = {"million": 1e6, "billion": 1e9, "m": 1e6, "b": 1e9, "bn": 1e9}
 
 
 def _numbers(text: str) -> list[tuple[float, float, str]]:
@@ -218,44 +218,57 @@ def _numbers(text: str) -> list[tuple[float, float, str]]:
     return out
 
 
-def _allowed_values(cited: list[GradedChunk | dict]) -> list[float]:
-    """Every value an answer may state, given what it cites.
+def _with_pairs(values: list[float]) -> list[float]:
+    """The values plus the difference and sum of any two - "a decrease of
+    $1,319 million" is $37,005 minus $35,686 million from the same passage."""
+    pairs = list(itertools.combinations(values, 2))
+    return values + [abs(a - b) for a, b in pairs] + [a + b for a, b in pairs]
+
+
+def _allowed_values(cited: list[GradedChunk | dict]) -> tuple[list[float], list[float]]:
+    """Every value an answer may state, given what it cites, as (in dollars,
+    as table cells). A "$" amount with no unit may only match the first.
 
     Facts: the value itself, plus sums, differences and % changes of up to
     three cited facts - the model is allowed to calculate ("liabilities fell
     by $22,522,000,000" is FY2024 minus FY2025, and appears in no source).
-    Passages: every number in their text, also read as millions and
-    billions, because 10-K tables are stated "in millions".
+    Passages: every number in their text, read as millions and billions,
+    because 10-K tables are stated "in millions".
     """
     fact_values = [f["value"] for f in cited if isinstance(f, dict)]
     # Outflows are stored negative ("cash used in financing": -120,686) but
     # written positive in an answer, so the size of each value counts too.
-    allowed = list(fact_values) + [abs(v) for v in fact_values]
+    dollars = list(fact_values) + [abs(v) for v in fact_values]
     for r in range(2, min(3, len(fact_values)) + 1):
         for combo in itertools.combinations(fact_values, r):
             for signs in itertools.product((1, -1), repeat=r):
-                allowed.append(abs(sum(s * v for s, v in zip(signs, combo))))
+                dollars.append(abs(sum(s * v for s, v in zip(signs, combo))))
     # The same figures restated in millions or billions without the unit, as
     # 10-K tables do: "(285,508 + 73,733 = 359,241)" checks the balance sheet
     # with Total liabilities 285,508,000,000 written in millions.
-    allowed += [v / 1e6 for v in allowed] + [v / 1e9 for v in allowed]
+    cells = [v / 1e6 for v in dollars] + [v / 1e9 for v in dollars]
     for a, b in itertools.permutations(fact_values, 2):
         if a:
-            allowed.append(abs(b - a) / abs(a) * 100)  # % change, either direction
+            cells.append(abs(b - a) / abs(a) * 100)  # % change, either direction
 
     # Passages: every number in their text, including bare table cells
-    # ("112,010"), plus the difference and sum of any two - "a decrease of
-    # $1,319" is $37,005 minus $35,686 from the same passage.
-    numbers = [
-        float(d.rstrip(",.").replace(",", ""))
-        for g in cited if not isinstance(g, dict)
-        for d in re.findall(r"\d[\d,]*(?:\.\d+)?", g.retrieved.chunk.text)
-    ]
-    pairs = list(itertools.combinations(numbers, 2))
-    numbers += [abs(a - b) for a, b in pairs] + [a + b for a, b in pairs]
-    for v in numbers:
-        allowed += [v, v * 1e6, v * 1e9]
-    return allowed
+    # ("112,010"). Only amounts with cents ("7.46" per share) are also dollars
+    # as written: table cells in millions are whole numbers, and "$10.2" for
+    # "$10.2 billion" has lost its unit just the same.
+    numbers, cents = [], []
+    for g in cited:
+        if isinstance(g, dict):
+            continue
+        for m in re.finditer(r"(\d[\d,]*(?:\.\d+)?)(\s*(?:million|billion))?", g.retrieved.chunk.text, re.IGNORECASE):
+            digits = m.group(1).rstrip(",.")
+            numbers.append(float(digits.replace(",", "")))
+            if "." in digits and not m.group(2):
+                cents.append(numbers[-1])
+    for v in _with_pairs(numbers):
+        cells.append(v)
+        dollars += [v * 1e6, v * 1e9]
+    dollars += _with_pairs(cents)
+    return dollars, cells
 
 
 def _unverified_numbers(text: str, cited: list[GradedChunk | dict]) -> list[str]:
@@ -263,14 +276,16 @@ def _unverified_numbers(text: str, cited: list[GradedChunk | dict]) -> list[str]
 
     A real citation next to a wrong number is the worst failure for this
     tool: "$11.2 billion [S1]" where S1 is 112,010 million would otherwise
-    pass, because the citation itself is real.
+    pass, because the citation itself is real. So would "$64,377" for a
+    table's 64,377 million: the digits match, but it reads as $64 thousand.
     """
-    allowed = _allowed_values(cited)
-    bad = [
-        written
-        for value, tol, written in _numbers(text)
-        if not any(abs(value - a) <= max(tol, 0.001 * abs(a)) for a in allowed)
-    ]
+    dollars, cells = _allowed_values(cited)
+    bad = []
+    for value, tol, written in _numbers(text):
+        unitless_dollars = written.startswith("$") and written[-1].isdigit()
+        allowed = dollars if unitless_dollars else dollars + cells
+        if not any(abs(value - a) <= max(tol, 0.001 * abs(a)) for a in allowed):
+            bad.append(written)
     return list(dict.fromkeys(bad))
 
 
