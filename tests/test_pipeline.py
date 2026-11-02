@@ -24,7 +24,9 @@ import pytest
 import dd.generation as gen
 import dd.self_healing as sh
 from dd.config import get_config
+from dd.models import Chunk, GradedChunk, RetrievedChunk
 from dd.models import Chunk, RetrievedChunk
+from dd.structured import describe_fact
 
 CFG = get_config().self_healing
 
@@ -195,6 +197,10 @@ def test_the_grader_gets_the_scale_headings_and_whole_passage_rule(world):
     for score in (CFG.strong_chunk_threshold, CFG.relevance_threshold, CFG.give_up_below):
         assert f"\n{score:g} - " in prompt
     assert "WHOLE passage" in prompt
+    # Figures have their own scale: sharing the passages' one, each figure of a
+    # comparison was graded 0.5, "one of several things asked for".
+    assert "Figures, on this scale instead:" in prompt
+    assert "company-wide total is not a figure for one product or segment" in prompt
 
 
 def test_grades_are_matched_by_marker_not_position(world):
@@ -354,9 +360,95 @@ def test_differences_of_passage_numbers_are_allowed(world):
     assert _no_number_warning(a)
 
 
+@pytest.mark.parametrize("label, value, table, written", [
+    ("Net income", 112_010e6, "income_statement", "$112,010 million"),
+    ("Diluted (in dollars per share)", 7.46, "income_statement", "$7.46 per share"),
+    ("Cash used in financing activities", -120_686e6, "cash_flow", "-$120,686 million"),
+    ("Odd amount", 1_234_567.0, "balance_sheet", "$1,234,567"),
+])
+def test_database_figures_are_described_in_millions_like_the_filing(label, value, table, written):
+    assert describe_fact(fact(label, value, table)).startswith(f"{label}, fiscal year 2025: {written} (from")
+
+
+def test_an_answer_in_millions_matches_the_stored_value(world):
+    world([passages("a1", 0.1)], facts=[fact("Net income", 112_010e6)],
+          groq=FakeGroq(fact_grades={"Net income": 0.9}, answer={
+              "answerable": True, "citations": ["[S1]"], "answer": "Net income was $112,010 million [S1]."}))
+    a = gen.answer("net income FY2025?")
+    assert _no_number_warning(a) and a.confidence.band == "high"
+
+
 def test_a_wrong_number_is_still_caught(world):
     world([passages("a1", 0.1)], facts=[fact("Net income", 112_010e6)],
           groq=FakeGroq(fact_grades={"Net income": 0.9}, answer={
               "answerable": True, "citations": ["[S1]"], "answer": "Net income was $11.2 billion [S1]."}))
     a = gen.answer("net income FY2025?")
     assert not _no_number_warning(a) and a.confidence.band == "low"
+
+
+def test_the_answer_prompt_names_the_section_when_a_passage_has_no_subsection():
+    """The grader sees "Item 1A / Risk Factors" (see _where); the answer model
+    must see the same location, not "Item 1A / " with nothing after the slash."""
+    retrieved = passages("a1", 0.9)  # item "Item 1A", section "Risk Factors", no subsection
+    evidence, _ = gen._build_evidence([GradedChunk(retrieved=retrieved[0], relevance=0.9)], [])
+    assert "[1] (Item 1A / Risk Factors)" in evidence
+
+
+def test_a_failure_says_what_went_wrong_not_just_its_type():
+    """A crash in search (a model that wouldn't load, a locked index) is also
+    reported as "Model call failed". Showing only "OSError" hid the cause."""
+    a = gen._model_failed("q", OSError("[WinError 1455] The paging file is too small\nsecond line"))
+    assert a.text.startswith("Model call failed (OSError: [WinError 1455] The paging file is too small)")
+    assert "second line" not in a.text
+    assert gen._model_failed("q", RuntimeError()).text.startswith("Model call failed (RuntimeError).")
+# --- confidence of answers resting on database figures ----------------------------
+
+W = get_config().confidence.weights
+
+
+def test_a_single_well_graded_figure_keeps_its_score(world):
+    world([passages("a1", 0.1)], facts=[fact("Net income", 112_010e6)],
+          groq=FakeGroq(fact_grades={"Net income": 0.9}, answer={
+              "answerable": True, "citations": ["[S1]"], "answer": "Net income was $112,010,000,000 [S1]."}))
+    a = gen.answer("net income FY2025?")
+    assert a.confidence.score == 0.9 and a.confidence.band == "high"
+
+
+def test_a_borderline_figure_drops_to_medium(world):
+    # The uncited 0.6 passage only gets Layer 4 past "2 relevant items".
+    world([passages("a1", 0.6)], facts=[fact("Net income", 112_010e6)],
+          groq=FakeGroq(fact_grades={"Net income": 0.55}, answer={
+              "answerable": True, "citations": ["[S1]"], "answer": "Net income was $112,010,000,000 [S1]."}))
+    a = gen.answer("net income FY2025?")
+    assert a.confidence.score == pytest.approx(0.9 * 0.55 / CFG.strong_chunk_threshold, abs=0.001)
+    assert a.confidence.band == "medium"
+    assert any("graded 0.55" in n for n in a.confidence.notes)
+
+
+def test_a_passage_that_restates_the_figure_does_not_lower_it(world):
+    """The income statement table writes net income as "112,010" (millions):
+    the same number, so citing it alongside [S1] changes nothing."""
+    p = passages("a1", 0.9)
+    p[0].chunk.text = "CONSOLIDATED STATEMENTS OF OPERATIONS (in millions) Net income 112,010 93,736 grade=0.9"
+    world([p], facts=[fact("Net income", 112_010e6)],
+          groq=FakeGroq(fact_grades={"Net income": 0.9}, answer={
+              "answerable": True, "citations": ["[S1]", "[1]"],
+              "answer": "Net income was $112,010,000,000 [S1][1]."}))
+    a = gen.answer("net income FY2025?")
+    assert a.confidence.score == 0.9 and a.confidence.band == "high"
+    assert not any("blended" in n for n in a.confidence.notes)
+
+
+def test_a_passage_that_adds_a_reason_is_blended_in(world):
+    """The passage below was found by one search only and has no reranker
+    score, so its search confidence is just the first-try part of the formula."""
+    p = passages("a1", 0.9)
+    p[0].chunk.text = "Services net sales grew due to higher advertising and cloud services. grade=0.9"
+    world([p], facts=[fact("Services", 109_158e6)],
+          groq=FakeGroq(fact_grades={"Services": 0.9}, answer={
+              "answerable": True, "citations": ["[S1]", "[1]"],
+              "answer": "Services net sales were $109,158,000,000 [S1], driven by advertising and cloud [1]."}))
+    a = gen.answer("Why did Services grow?")
+    assert a.confidence.score == pytest.approx((0.9 + W.loop_cleanliness * 1.0) / 2, abs=0.001)
+    assert a.confidence.band != "high"
+    assert any("1 cited passage(s) carry part of the answer" in n for n in a.confidence.notes)

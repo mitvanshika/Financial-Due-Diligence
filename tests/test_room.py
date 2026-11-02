@@ -20,9 +20,12 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
+from starlette.websockets import WebSocketDisconnect
 
 import dd.room as room_mod
-from dd.models import Answer, Citation, ConfidenceBreakdown
+from dd.models import (
+    Answer, Chunk, Citation, ConfidenceBreakdown, GradedChunk, RetrievalOutcome, RetrievedChunk,
+)
 from dd.room import Room
 from dd.server import create_app
 
@@ -456,3 +459,203 @@ def test_pipeline_progress_is_optional_and_never_breaks_the_answer():
 
     emit(None, "search", attempt=1)
     emit(broken_listener, "search", attempt=1)  # must not raise
+
+
+# --- how the room shows a passage -------------------------------------------------
+
+
+def _answer_with_passage(subsection: str) -> Answer:
+    chunk = Chunk(chunk_id="c1", text="x", company="Apple Inc.", ticker="AAPL", form="10-K",
+                  fiscal_year="FY2025", item="Item 1A", section="Risk Factors", subsection=subsection)
+    outcome = RetrievalOutcome(
+        original_query="q", final_query="q", succeeded=True, relevance_threshold=0.5,
+        chunks=[GradedChunk(retrieved=RetrievedChunk(chunk=chunk), relevance=0.9, reason="r")],
+    )
+    return Answer(query="q", answered=True, text="t", outcome=outcome)
+
+
+def test_a_passage_without_a_subsection_shows_its_section(fakes):
+    """The grader is told "Item 1A / Risk Factors"; the card must say the same."""
+    assert room_mod.answer_view(_answer_with_passage(""))["passages"][0]["where"] == "Item 1A / Risk Factors"
+    assert room_mod.answer_view(_answer_with_passage("Tariffs"))["passages"][0]["where"] == "Item 1A / Tariffs"
+
+
+def test_full_passage_text_keeps_ordinary_spacing():
+    """Only the filing's wide column padding is squeezed, not every double space."""
+    assert room_mod.readable("Item 1A.  Risk Factors") == "Item 1A.  Risk Factors"
+    assert room_mod.readable("a" + " " * 30 + "b") == "a   b"
+
+
+# --- a frozen browser must not freeze the room (review item 7) -----------------------
+
+
+class StuckConn:
+    """A browser whose connection has frozen: sending to it never finishes."""
+
+    async def send_json(self, data: Any) -> None:
+        await asyncio.Event().wait()
+
+
+def test_a_stalled_connection_does_not_freeze_the_room_for_everyone(fakes, monkeypatch):
+    monkeypatch.setattr(room_mod, "SEND_TIMEOUT", 0.2, raising=False)
+
+    async def scenario():
+        room = await started_room()
+        await asyncio.wait_for(room.join(StuckConn(), "Stuck"), 3)
+        healthy = FakeConn()
+        await asyncio.wait_for(room.join(healthy, "Ana"), 3)
+        assert [m["name"] for m in healthy.last_state["members"]] == ["Ana"], "the frozen one is dropped"
+        await room.stop()
+    run(scenario())
+
+
+# --- nobody outside the page itself may join (review item 7.2) ---------------------------
+
+
+def test_a_page_from_another_site_cannot_join_the_room(fakes):
+    """Without this, any website open in a team member's browser could connect
+    to a room on localhost, ask questions and vote."""
+    with TestClient(create_app()) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws", headers={"origin": "http://evil.example"}) as ws:
+                ws.send_json({"type": "join", "name": "Mallory"})
+                ws.receive_json()
+        assert client.get("/api/health").json()["members"] == 0
+
+
+def test_the_rooms_own_page_can_join(fakes):
+    with TestClient(create_app()) as client:
+        with client.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
+            ws.send_json({"type": "join", "name": "Ana"})
+            assert _next(ws, "state")["state"]["members"][0]["name"] == "Ana"
+
+
+# --- the room remembers across a restart (review item 7.1) ---------------------------------
+
+
+def test_history_and_finished_actions_survive_a_restart(fakes, tmp_path):
+    state_file = tmp_path / "room_state.json"
+
+    async def first_session():
+        room = Room(state_file=state_file)
+        await room.start()
+        await until(lambda: room.status == "ready")
+        ana = await room.join(FakeConn(), "Ana")
+        qid = await answered_question(room, ana, "Why did Services grow?")
+        await room.propose(ana, "checklist", qid)
+        await until(lambda: room.pending_action is not None and room.pending_action["status"] == "voting")
+        await room.vote(ana, room.pending_action["id"], True)
+        await until(lambda: room.pending_action is None)
+        await room.stop()
+
+    async def second_session():
+        room = Room(state_file=state_file)
+        await room.start()
+        snap = room.snapshot()
+        assert [h["text"] for h in snap["history"]] == ["Why did Services grow?"]
+        assert snap["history"][0]["answer"]["text"].startswith("Net income")
+        assert [(a["kind"], a["status"]) for a in snap["action_history"]] == [("checklist", "done")]
+        assert any("proposed a checklist" in line["text"] for line in snap["log"])
+        await room.stop()
+
+    run(first_session())
+    run(second_session())
+
+
+def test_a_garbled_state_file_does_not_stop_the_room_starting(fakes, tmp_path):
+    state_file = tmp_path / "room_state.json"
+    state_file.write_text("{oops", encoding="utf-8")
+
+    async def scenario():
+        room = Room(state_file=state_file)
+        await room.start()
+        assert room.history == [] and room.action_history == []
+        await room.stop()
+    run(scenario())
+
+
+def test_without_a_state_file_nothing_is_written(fakes, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    async def scenario():
+        room = await started_room()
+        ana = await room.join(FakeConn(), "Ana")
+        await answered_question(room, ana)
+        await room.stop()
+    run(scenario())
+    assert list(tmp_path.iterdir()) == []
+
+
+# --- a dropped connection gets a grace period (a Wi-Fi blip is not leaving) ---------------
+
+
+async def open_vote(room: Room, ana: str) -> str:
+    qid = await answered_question(room, ana)
+    await room.propose(ana, "checklist", qid)
+    await until(lambda: room.pending_action is not None and room.pending_action["status"] == "voting")
+    return room.pending_action["id"]
+
+
+def test_a_voter_who_reconnects_in_time_keeps_their_place(fakes):
+    async def scenario():
+        room = await started_room()
+        ana = await room.join(FakeConn(), "Ana")
+        ben = await room.join(FakeConn(), "Ben")
+        action_id = await open_vote(room, ana)
+        await room.vote(ana, action_id, True)
+
+        await room.disconnect(ben)  # Ben's Wi-Fi blinks
+        assert room.pending_action["status"] == "voting", "must not run without Ben"
+        assert [(m["name"], m["away"]) for m in room.snapshot()["members"]] == [("Ana", False), ("Ben", True)]
+
+        again = await room.join(FakeConn(), "Ben")  # the page reconnects by itself
+        assert again == ben, "same person, same place - not 'Ben (2)'"
+        await room.vote(again, action_id, True)
+        await until(lambda: room.pending_action is None)
+        assert room.action_history[-1]["status"] == "done"
+        await room.stop()
+    run(scenario())
+
+
+def test_a_voter_who_does_not_come_back_is_dropped_after_the_grace_period(fakes, monkeypatch):
+    monkeypatch.setattr(room_mod, "GRACE_SECONDS", 0.2, raising=False)
+
+    async def scenario():
+        room = await started_room()
+        ana = await room.join(FakeConn(), "Ana")
+        ben = await room.join(FakeConn(), "Ben")
+        action_id = await open_vote(room, ana)
+        await room.vote(ana, action_id, True)
+        await room.disconnect(ben)
+        await until(lambda: room.pending_action is None, timeout=3)
+        assert room.action_history[-1]["status"] == "done"
+        assert [m["name"] for m in room.snapshot()["members"]] == ["Ana"]
+        await room.stop()
+    run(scenario())
+
+
+def test_someone_who_was_away_is_not_asked_to_vote_on_a_new_action(fakes):
+    async def scenario():
+        room = await started_room()
+        ana = await room.join(FakeConn(), "Ana")
+        ben = await room.join(FakeConn(), "Ben")
+        await room.disconnect(ben)
+        await open_vote(room, ana)
+        assert [v["name"] for v in room.snapshot()["pending_action"]["voters"]] == ["Ana"]
+        await room.stop()
+    run(scenario())
+
+
+def test_a_late_close_report_from_an_old_connection_does_not_push_a_reconnected_person_away(fakes):
+    async def scenario():
+        room = await started_room()
+        old, new = FakeConn(), FakeConn()
+        ben = await room.join(old, "Ben")
+        await room.disconnect(ben, old)
+        assert await room.join(new, "Ben") == ben
+        await room.disconnect(ben, old)  # the old socket is only now reported closed
+        assert room.snapshot()["members"][0]["away"] is False
+        await room.disconnect(ben, new)  # the live connection really closing still counts
+        assert room.snapshot()["members"][0]["away"] is True
+        await room.stop()
+    run(scenario())

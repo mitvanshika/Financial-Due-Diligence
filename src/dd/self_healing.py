@@ -76,12 +76,10 @@ parentheses. Read the \
 WHOLE passage, not just its first sentence: a passage can open with the end \
 of an unrelated paragraph and still answer the question further on.
 
-Items marked [S1], [S2]... are figures from the financial statements. A \
-figure is relevant only if it is one of the numbers needed to answer the \
-question - the right measure, not just the right topic (revenue in dollars \
-is not "units sold").
+Items marked [S1], [S2]... are figures from the financial statements; the \
+others are passages. Score each item on its own.
 
-Score each item on its own, on this scale:
+Passages, on this scale:
 1.0 - states exactly what was asked: the right company, measure and period.
 {strong} - contains the answer, but one small step is needed (e.g. picking \
 the right year column of a table, or the answer is not the passage's main \
@@ -90,7 +88,18 @@ point).
 or the right measure for a different period.
 {weak} - same area, but none of the information asked for.
 0.0 - unrelated.
-Use a value in between when an item falls between two steps.
+Use a value in between when a passage falls between two steps.
+
+Figures, on this scale instead:
+1.0 - exactly a measure and period the question names. A change, trend or \
+comparison needs several figures, one per measure and year: each of them is \
+complete for its part and scores 1.0, even though it does not answer the \
+question alone.
+{relevant} - the right measure for a different period.
+{weak} - the right topic but the wrong measure: revenue in dollars is not \
+"units sold", and a company-wide total is not a figure for one product or \
+segment.
+0.0 - unrelated.
 
 For EACH item give its marker exactly as shown (e.g. "[0]" or "[S1]"), its \
 score and a one-sentence reason. Return exactly {n} grades, one per item."""
