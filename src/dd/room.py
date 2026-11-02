@@ -32,9 +32,12 @@ an async `send_json(dict)` method. server.py does the networking.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from pydantic import ValidationError
@@ -45,6 +48,12 @@ MAX_NAME = 40
 MAX_QUESTION = 500
 KEEP_HISTORY = 20
 KEEP_LOG = 50
+# A browser that takes longer than this to accept a message is treated as gone.
+# Without a limit, one frozen connection would hold up every update for everyone.
+SEND_TIMEOUT = 5.0
+# A dropped connection (a Wi-Fi blink, a page refresh) keeps its place in the room
+# this long. The page reconnects by itself every 2 seconds.
+GRACE_SECONDS = 30.0
 
 
 class Connection(Protocol):
@@ -93,7 +102,7 @@ def readable(text: str) -> str:
     """A passage as people read it: one table row per line, columns kept apart
     by three spaces. The filing pads its table columns with dozens of spaces
     and draws rules with ─ - layout only, and most of a table chunk's size."""
-    lines = (re.sub(r"\s{2,}", "   ", line.replace("─", " ").strip()) for line in text.splitlines())
+    lines = (re.sub(r"[ \t\u00a0]{4,}", "   ", line.replace("─", " ").strip()) for line in text.splitlines())
     return "\n".join(line for line in lines if line)
 
 
@@ -107,7 +116,7 @@ def answer_view(a: Answer) -> dict[str, Any]:
         for g in sorted(a.outcome.chunks, key=lambda g: g.relevance, reverse=True):
             c = g.retrieved.chunk
             passages.append({
-                "where": f"{c.item} / {c.subsection}" if c.subsection else c.item,
+                "where": " / ".join(x for x in (c.item, c.subsection or c.section) if x),
                 "relevance": round(g.relevance, 2),
                 "reason": g.reason,
                 "snippet": " ".join(c.text.split())[:300],
@@ -139,7 +148,11 @@ def answer_view(a: Answer) -> dict[str, Any]:
 
 
 class Room:
-    def __init__(self) -> None:
+    def __init__(self, state_file: Path | None = None) -> None:
+        # With a state_file the room keeps its question history, finished
+        # actions and activity log across restarts. Without one (the tests'
+        # default) it stays purely in memory and writes nothing.
+        self.state_file = state_file
         self.members: dict[str, dict[str, Any]] = {}  # id -> {"name": str, "conn": Connection}
         self.status = "loading"  # -> "ready" once the models are loaded
         self.queue: list[dict[str, Any]] = []
@@ -155,6 +168,50 @@ class Room:
         self._ready = asyncio.Event()  # set once the models are loaded
         self._send_lock = asyncio.Lock()  # one broadcast at a time per connection
         self._tasks: list[asyncio.Task] = []
+        self._expiry: dict[str, asyncio.Task] = {}  # away member id -> task that removes them
+        self._load_state()
+
+    # --- saved state ---------------------------------------------------------
+
+    def _load_state(self) -> None:
+        """Restore what a restart would otherwise wipe. Not restored: the full
+        answers (so actions can only be proposed on questions asked since the
+        restart), the queue, and any vote in progress."""
+        if self.state_file is None or not self.state_file.exists():
+            return
+        try:
+            saved = json.loads(self.state_file.read_text(encoding="utf-8"))
+            self.history = list(saved["history"])[-KEEP_HISTORY:]
+            self.action_history = [{"_view": v} for v in saved["action_history"]][-KEEP_HISTORY:]
+            self.log = list(saved["log"])[-KEEP_LOG:]
+        except (OSError, ValueError, KeyError, TypeError):
+            # Unreadable: keep a copy for inspection and start empty rather
+            # than refuse to start.
+            self.history, self.action_history, self.log = [], [], []
+            try:
+                os.replace(self.state_file, self.state_file.with_name(self.state_file.name + ".bad"))
+            except OSError:
+                pass
+            self._note("saved room state could not be read - starting empty")
+
+    def _save_state(self) -> None:
+        """Called when a question or an action finishes (not on every step: the
+        state is large). Written to a temporary file and swapped in, so a crash
+        never leaves half a file. A failed save never breaks the room."""
+        if self.state_file is None:
+            return
+        data = {
+            "history": self.history,
+            "action_history": [self._saved_view(a) for a in self.action_history],
+            "log": self.log,
+        }
+        tmp = self.state_file.with_name(self.state_file.name + ".tmp")
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
+            os.replace(tmp, self.state_file)
+        except OSError as exc:
+            self._note(f"could not save room state: {type(exc).__name__}: {exc}")
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -164,9 +221,10 @@ class Room:
         self._tasks.append(asyncio.create_task(self._worker()))
 
     async def stop(self) -> None:
-        for t in self._tasks:
+        tasks = self._tasks + list(self._expiry.values())
+        for t in tasks:
             t.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _warm(self) -> None:
         try:
@@ -183,6 +241,15 @@ class Room:
         name = " ".join(name.split())[:MAX_NAME]
         if not name:
             raise ValueError("please enter a name")
+        for member_id, m in self.members.items():
+            if m.get("away") and m["name"] == name:
+                # Same name as someone whose connection just dropped: this is
+                # them coming back, so they keep their place (and any vote).
+                m["conn"], m["away"] = conn, False
+                self._cancel_expiry(member_id)
+                self._note(f"{name} reconnected")
+                await self.broadcast()
+                return member_id
         taken = {m["name"] for m in self.members.values()}
         base, n = name, 2
         while name in taken:  # two people both called "Sam" stay distinguishable
@@ -193,7 +260,32 @@ class Room:
         await self.broadcast()
         return member_id
 
+    async def disconnect(self, member_id: str, conn: Connection | None = None) -> None:
+        """A connection ended. The person stays in the room, marked away, for
+        GRACE_SECONDS: if they reconnect in time nothing changes for them; if
+        not, they leave for good and a vote stops waiting on them. `conn` is the
+        connection that ended: a late report about an OLD connection must not
+        push someone away who has already reconnected on a new one."""
+        member = self.members.get(member_id)
+        if member is None or member.get("away") or (conn is not None and member["conn"] is not conn):
+            return
+        member["away"] = True
+        self._note(f"{member['name']} lost connection")
+        self._expiry[member_id] = asyncio.create_task(self._expire(member_id))
+        await self.broadcast()
+
+    async def _expire(self, member_id: str) -> None:
+        await asyncio.sleep(GRACE_SECONDS)
+        self._expiry.pop(member_id, None)
+        await self.leave(member_id)
+
+    def _cancel_expiry(self, member_id: str) -> None:
+        task = self._expiry.pop(member_id, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
     async def leave(self, member_id: str) -> None:
+        self._cancel_expiry(member_id)
         member = self.members.pop(member_id, None)
         if member is None:
             return
@@ -258,6 +350,7 @@ class Room:
             self.history.append(entry)
             self._trim_history()
             self.current = None
+            self._save_state()
             await self.broadcast()
 
     def _step_from_thread(self, question_id: str, stage: str, details: dict) -> None:
@@ -320,7 +413,7 @@ class Room:
 
         # Step 3: the room votes. Everyone present right now must approve.
         action["status"] = "voting"
-        action["voters"] = list(self.members)
+        action["voters"] = [i for i, m in self.members.items() if not m.get("away")]
         await self._settle_vote()  # if nobody is left in the room, cancel it
         await self.broadcast()
 
@@ -367,12 +460,18 @@ class Room:
         self.action_history.append(action)
         self.action_history = self.action_history[-KEEP_HISTORY:]
         self.pending_action = None
+        self._save_state()
 
     # --- what everyone sees ------------------------------------------------------
 
     def _note(self, text: str) -> None:
         self.log.append({"at": _now(), "text": text})
         self.log = self.log[-KEEP_LOG:]
+
+    def _saved_view(self, a: dict[str, Any]) -> dict[str, Any] | None:
+        """An action_history entry as people see it. Entries restored from a
+        previous run are already in that form."""
+        return a["_view"] if "_view" in a else self._action_view(a)
 
     def _action_view(self, a: dict[str, Any] | None) -> dict[str, Any] | None:
         if a is None:
@@ -389,12 +488,12 @@ class Room:
     def snapshot(self) -> dict[str, Any]:
         return {
             "status": self.status,
-            "members": [{"id": i, "name": m["name"]} for i, m in self.members.items()],
+            "members": [{"id": i, "name": m["name"], "away": bool(m.get("away"))} for i, m in self.members.items()],
             "queue": self.queue,
             "current": self.current,
             "history": self.history,
             "pending_action": self._action_view(self.pending_action),
-            "action_history": [self._action_view(a) for a in self.action_history],
+            "action_history": [self._saved_view(a) for a in self.action_history],
             "actions": list(get_actions()),
             "log": self.log,
         }
@@ -404,8 +503,39 @@ class Room:
         updates never interleave on the same connection."""
         async with self._send_lock:
             state = self.snapshot()
-            for member_id, member in list(self.members.items()):
-                try:
-                    await member["conn"].send_json({"type": "state", "you": member_id, "state": state})
-                except Exception:  # noqa: BLE001 - a dead connection is removed on disconnect
-                    pass
+            members = [(i, m) for i, m in self.members.items() if not m.get("away")]
+            # All at once, each with a time limit: one slow or frozen browser
+            # must not delay the others.
+            results = await asyncio.gather(*(
+                self._send(m["conn"], {"type": "state", "you": member_id, "state": state})
+                for member_id, m in members
+            ))
+        for (member_id, _), in_time in zip(members, results):
+            if not in_time:
+                await self._drop(member_id)
+
+    async def _send(self, conn: Connection, message: dict[str, Any]) -> bool:
+        """False only when the connection took too long to accept the message.
+        Any other failure is a dead connection, removed when it disconnects."""
+        try:
+            await asyncio.wait_for(conn.send_json(message), SEND_TIMEOUT)
+        except asyncio.TimeoutError:
+            return False
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
+    async def _drop(self, member_id: str) -> None:
+        """Remove a frozen connection from the room and close it, so its browser
+        reconnects (the page does this by itself) instead of staying half-joined."""
+        member = self.members.get(member_id)
+        if member is None:
+            return
+        self._note(f"{member['name']} stopped responding and was removed")
+        await self.leave(member_id)
+        close = getattr(member["conn"], "close", None)
+        if close is not None:
+            try:
+                await asyncio.wait_for(close(), 1)
+            except Exception:  # noqa: BLE001 - best effort
+                pass

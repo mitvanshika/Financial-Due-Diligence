@@ -28,3 +28,10 @@ dist/
 
 # Layer 7 web app - rebuild with: cd web; npm install; npm run build
 node_modules/
+
+# Layer 6/7 runtime records: written by whichever machine runs `dd serve`/`dd act`
+data/checklist.json
+data/review_queue.json
+data/memos/
+data/room_state.json
+data/*.tmp

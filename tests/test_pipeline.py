@@ -24,6 +24,7 @@ import pytest
 import dd.generation as gen
 import dd.self_healing as sh
 from dd.config import get_config
+from dd.models import Chunk, GradedChunk, RetrievedChunk
 from dd.models import Chunk, RetrievedChunk
 from dd.structured import describe_fact, match_structured_query, segments_mentioned
 
@@ -526,6 +527,21 @@ def test_a_wrong_number_is_still_caught(world):
     assert not _no_number_warning(a) and a.confidence.band == "low"
 
 
+def test_the_answer_prompt_names_the_section_when_a_passage_has_no_subsection():
+    """The grader sees "Item 1A / Risk Factors" (see _where); the answer model
+    must see the same location, not "Item 1A / " with nothing after the slash."""
+    retrieved = passages("a1", 0.9)  # item "Item 1A", section "Risk Factors", no subsection
+    evidence, _ = gen._build_evidence([GradedChunk(retrieved=retrieved[0], relevance=0.9)], [])
+    assert "[1] (Item 1A / Risk Factors)" in evidence
+
+
+def test_a_failure_says_what_went_wrong_not_just_its_type():
+    """A crash in search (a model that wouldn't load, a locked index) is also
+    reported as "Model call failed". Showing only "OSError" hid the cause."""
+    a = gen._model_failed("q", OSError("[WinError 1455] The paging file is too small\nsecond line"))
+    assert a.text.startswith("Model call failed (OSError: [WinError 1455] The paging file is too small)")
+    assert "second line" not in a.text
+    assert gen._model_failed("q", RuntimeError()).text.startswith("Model call failed (RuntimeError).")
 # --- confidence of answers resting on database figures ----------------------------
 
 W = get_config().confidence.weights

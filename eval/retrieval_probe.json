@@ -1,0 +1,119 @@
+{
+  "_about": "Gold chunks for retrieval-only checks. 'any_of': the need is met if ANY of these chunks is in the final 6. Each id was chosen by reading the chunk's full text in data/processed/chunks.jsonl. Rebuild the index (dd chunk + dd index) and these ids may change - re-verify them.",
+  "probes": [
+    {
+      "question": "What risks does Apple disclose related to tariffs and international trade restrictions?",
+      "needs": [
+        {
+          "name": "2025 tariffs and the countries named",
+          "any_of": [
+            "AAPL-10-K-FY2025-0037",
+            "AAPL-10-K-FY2025-0181"
+          ]
+        },
+        {
+          "name": "cost / supply-chain impact of tariffs",
+          "any_of": [
+            "AAPL-10-K-FY2025-0182",
+            "AAPL-10-K-FY2025-0038",
+            "AAPL-10-K-FY2025-0034"
+          ]
+        }
+      ]
+    },
+    {
+      "question": "What cybersecurity-related risks does Apple describe in its filing?",
+      "needs": [
+        {
+          "name": "attacks happen regularly",
+          "any_of": [
+            "AAPL-10-K-FY2025-0087"
+          ]
+        },
+        {
+          "name": "Apple is a higher-value target",
+          "any_of": [
+            "AAPL-10-K-FY2025-0089"
+          ]
+        }
+      ]
+    },
+    {
+      "question": "What risk does Apple disclose regarding natural disasters and its facilities?",
+      "needs": [
+        {
+          "name": "facilities in disaster-prone areas",
+          "any_of": [
+            "AAPL-10-K-FY2025-0039"
+          ]
+        }
+      ]
+    },
+    {
+      "question": "Why did Wearables, Home and Accessories net sales decrease in FY2025?",
+      "needs": [
+        {
+          "name": "MD&A reason for the decrease",
+          "any_of": [
+            "AAPL-10-K-FY2025-0195"
+          ]
+        }
+      ]
+    },
+    {
+      "question": "Why did Services net sales increase in FY2025?",
+      "needs": [
+        {
+          "name": "MD&A reason for the increase",
+          "any_of": [
+            "AAPL-10-K-FY2025-0196"
+          ]
+        }
+      ]
+    },
+    {
+      "question": "What risk does Apple disclose about acquisitions and new business investments?",
+      "needs": [
+        {
+          "name": "acquisition risks",
+          "any_of": [
+            "AAPL-10-K-FY2025-0093"
+          ]
+        }
+      ]
+    },
+    {
+      "question": "What does Apple disclose about legal proceedings and government investigations as a risk?",
+      "needs": [
+        {
+          "name": "legal proceedings risk",
+          "any_of": [
+            "AAPL-10-K-FY2025-0095"
+          ]
+        }
+      ]
+    },
+    {
+      "question": "Apple's Products gross margin dollars increased in FY2025 ($112,887M vs $109,633M in FY2024) but Products gross margin percentage decreased (36.8% vs 37.2%). What explains this?",
+      "needs": [
+        {
+          "name": "MD&A Products gross margin explanation",
+          "any_of": [
+            "AAPL-10-K-FY2025-0203"
+          ]
+        }
+      ]
+    },
+    {
+      "question": "Apple's net income dipped from $96,995M in FY2023 to $93,736M in FY2024 before rising sharply to $112,010M in FY2025. What caused the FY2024 dip?",
+      "needs": [
+        {
+          "name": "one-time $10.2B State Aid tax charge in Q4 FY2024",
+          "any_of": [
+            "AAPL-10-K-FY2025-0371"
+          ]
+        }
+      ]
+    }
+  ]
+}

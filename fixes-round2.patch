@@ -1,0 +1,412 @@
+diff --git a/config.yaml b/config.yaml
+index 0fb72d9..31d2d9f 100644
+--- a/config.yaml
++++ b/config.yaml
+@@ -49,6 +49,9 @@ retrieval:
+   rerank_candidates: 25
+   # How many reranked chunks are handed to Layer 4.
+   final_top_k: 6
++  # A chunk BOTH searches rank in their top N is kept even if the reranker
++  # scores it low (it cut the MD&A tariff passage: vector #2, BM25 #4).
++  keep_if_both_top: 5
+ 
+ reranker:
+   model: BAAI/bge-reranker-large
+diff --git a/eval/compare_runs.py b/eval/compare_runs.py
+new file mode 100644
+index 0000000..34c25be
+--- /dev/null
++++ b/eval/compare_runs.py
+@@ -0,0 +1,32 @@
++"""Show one question's answer from two eval runs side by side.
++
++    python eval/compare_runs.py eval/results_round2_before.jsonl eval/results.jsonl cybersecurity
++
++The last argument is any part of the question text (not case-sensitive).
++"""
++
++import json
++import sys
++
++
++def load(path: str) -> dict[str, dict]:
++    rows = [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]
++    return {r["question"]: r for r in rows if "question" in r}  # skips the _meta line
++
++
++before_path, after_path, search = sys.argv[1], sys.argv[2], sys.argv[3].lower()
++before, after = load(before_path), load(after_path)
++
++for question in [q for q in after if search in q.lower()] or ["(no question matches)"]:
++    print(f"\n=== {question}\n")
++    for label, rows in (("BEFORE", before), ("AFTER", after)):
++        r = rows.get(question)
++        if r is None:
++            print(f"{label}: (not in this run)\n")
++            continue
++        status = "answered" if r["answered"] else "REFUSED"
++        print(f"{label}: {status}, band={r['band']}, confidence={r['confidence']}")
++        print(r["text"])
++        for c in r["citations"]:
++            print(f"  {c}")
++        print()
+diff --git a/eval/run_eval.py b/eval/run_eval.py
+index dc81537..5b98db0 100644
+--- a/eval/run_eval.py
++++ b/eval/run_eval.py
+@@ -55,6 +55,8 @@ RESULTS = EVAL_DIR / "results.jsonl"
+ REVIEW = EVAL_DIR / "review.md"
+ 
+ AUTO_TYPES = {"numeric_lookup", "no_answer"}
++# Start of the text generation.py returns when a Groq call fails.
++MODEL_FAILED = "Model call failed"
+ 
+ # --- scoring ---------------------------------------------------------------
+ 
+@@ -215,6 +217,12 @@ def run(types: set[str] | None, repeat: int) -> list[dict]:
+                 # Not saved, so the next run retries it. Usually a rate limit.
+                 print(f"    ERROR (will retry next run): {type(exc).__name__}: {exc}")
+                 continue
++            if a.text.startswith(MODEL_FAILED):
++                # Layer 5 reports a failed model call as a refusal instead of
++                # crashing. That is not an answer: saved, it would score as a
++                # correct refusal on no_answer questions. Skip it and retry.
++                print(f"    ERROR (will retry next run): {a.text}")
++                continue
+ 
+             result = {
+                 "question": q,
+diff --git a/src/dd/cli.py b/src/dd/cli.py
+index b3c552b..63f3ad6 100644
+--- a/src/dd/cli.py
++++ b/src/dd/cli.py
+@@ -284,10 +284,15 @@ def _print_answer(a) -> None:
+         console.print(f"  {c.marker} {c.source}")
+     cf = a.confidence
+     console.print()
+-    console.print(
+-        f"[bold]confidence:[/] {cf.band.upper()} ({cf.score})  "
+-        f"hybrid={cf.hybrid_agreement} rerank={cf.rerank_strength} loop={cf.loop_cleanliness}"
+-    )
++    # Answers citing a database figure ([S1]...) are scored from the figures,
++    # not these three search measures - printing them would read as "0 = failed".
++    if any(c.marker.startswith("[S") for c in a.citations):
++        console.print(f"[bold]confidence:[/] {cf.band.upper()} ({cf.score})")
++    else:
++        console.print(
++            f"[bold]confidence:[/] {cf.band.upper()} ({cf.score})  "
++            f"hybrid={cf.hybrid_agreement} rerank={cf.rerank_strength} loop={cf.loop_cleanliness}"
++        )
+     for n in cf.notes:
+         console.print(f"  note: {n}")
+     console.print(f"[dim]({a.elapsed_s}s)[/]")
+diff --git a/src/dd/config.py b/src/dd/config.py
+index 6bd0376..d5298d8 100644
+--- a/src/dd/config.py
++++ b/src/dd/config.py
+@@ -87,6 +87,7 @@ class RetrievalCfg(BaseModel):
+     rrf_k: int = 60
+     rerank_candidates: int = 25
+     final_top_k: int = 6
++    keep_if_both_top: int = 5
+ 
+ 
+ class RerankerCfg(BaseModel):
+diff --git a/src/dd/generation.py b/src/dd/generation.py
+index 8966906..6e17d77 100644
+--- a/src/dd/generation.py
++++ b/src/dd/generation.py
+@@ -137,6 +137,8 @@ def _ask_model(question: str, evidence: str, cfg: Config) -> dict:
+ # --- Step 3: check which citations are real ---------------------------------
+ 
+ _MARKER_RE = re.compile(r"\[S?\d+\]")
++# A new sentence starts after . ! or ? and a space.
++_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+ 
+ 
+ def _check_citations(
+@@ -233,16 +235,26 @@ def _allowed_values(cited: list[GradedChunk | dict]) -> list[float]:
+         for combo in itertools.combinations(fact_values, r):
+             for signs in itertools.product((1, -1), repeat=r):
+                 allowed.append(abs(sum(s * v for s, v in zip(signs, combo))))
++    # The same figures restated in millions or billions without the unit, as
++    # 10-K tables do: "(285,508 + 73,733 = 359,241)" checks the balance sheet
++    # with Total liabilities 285,508,000,000 written in millions.
++    allowed += [v / 1e6 for v in allowed] + [v / 1e9 for v in allowed]
+     for a, b in itertools.permutations(fact_values, 2):
+         if a:
+             allowed.append(abs(b - a) / abs(a) * 100)  # % change, either direction
+ 
+-    for g in cited:
+-        if not isinstance(g, dict):
+-            # Every number in the passage, including bare table cells ("112,010").
+-            for digits in re.findall(r"\d[\d,]*(?:\.\d+)?", g.retrieved.chunk.text):
+-                v = float(digits.rstrip(",.").replace(",", ""))
+-                allowed += [v, v * 1e6, v * 1e9]
++    # Passages: every number in their text, including bare table cells
++    # ("112,010"), plus the difference and sum of any two - "a decrease of
++    # $1,319" is $37,005 minus $35,686 from the same passage.
++    numbers = [
++        float(d.rstrip(",.").replace(",", ""))
++        for g in cited if not isinstance(g, dict)
++        for d in re.findall(r"\d[\d,]*(?:\.\d+)?", g.retrieved.chunk.text)
++    ]
++    pairs = list(itertools.combinations(numbers, 2))
++    numbers += [abs(a - b) for a, b in pairs] + [a + b for a, b in pairs]
++    for v in numbers:
++        allowed += [v, v * 1e6, v * 1e9]
+     return allowed
+ 
+ 
+@@ -428,8 +440,22 @@ def generate_answer(
+             outcome=outcome,
+         )
+ 
++    # The citations list says which sources were used; the text must also show
++    # where. A one-sentence answer can only come from its cited sources, so the
++    # markers go on its end. A longer one could mix them up - leave it as it
++    # is, but don't call it HIGH.
++    untied = not _MARKER_RE.search(text)
++    if untied and len(_SENTENCE_RE.split(text)) == 1:
++        markers = "".join(c.marker for c in citations)
++        text = f"{text[:-1]} {markers}." if text.endswith(".") else f"{text} {markers}"
++        untied = False
++
+     confidence = _confidence(outcome, text, citations, lookup, conf)
+     confidence.notes = notes + confidence.notes
++    if untied:
++        confidence.score = min(confidence.score, conf.confidence.bands.high - 0.01)
++        confidence.band = _band(confidence.score, conf)
++        confidence.notes.append("sources are not tied to specific sentences - check them before relying on it")
+     return Answer(
+         query=query,
+         answered=True,
+diff --git a/src/dd/retrieval.py b/src/dd/retrieval.py
+index 8bc3546..494c0b0 100644
+--- a/src/dd/retrieval.py
++++ b/src/dd/retrieval.py
+@@ -146,6 +146,39 @@ def hybrid_retrieve(query: str, cfg: Config | None = None) -> list[RetrievedChun
+         for cid in shortlist_ids
+         if cid in by_id  # defensive: a stale index could reference a dropped chunk
+     ]
++    candidates = _drop_duplicates(candidates)
+ 
+     reranked = rerank(query, candidates, conf)
+-    return reranked[: r.final_top_k]
+\ No newline at end of file
++
++    # The reranker picks the final passages - it reads each one WITH the
++    # question, so it reliably throws out boilerplate that merely shares words
++    # with it ("Available Information", the signature page). One exception: a
++    # passage BOTH searches rank in their top few is always kept. On the
++    # tariffs question the reranker scored the MD&A tariff passage 0.0005
++    # although it was vector #2 and BM25 #4, and cut it. (Giving the searches
++    # a full vote instead let boilerplate in and broke the cybersecurity
++    # question.)
++    top = r.keep_if_both_top
++    agreed = [
++        c for c in reranked
++        if c.vector_rank is not None and c.vector_rank <= top
++        and c.bm25_rank is not None and c.bm25_rank <= top
++    ][: r.final_top_k]
++    rest = [c for c in reranked if c not in agreed]
++    final = agreed + rest[: r.final_top_k - len(agreed)]
++    return sorted(final, key=lambda c: c.rerank_score, reverse=True)
++
++
++def _drop_duplicates(candidates: list[RetrievedChunk]) -> list[RetrievedChunk]:
++    """The 10-K repeats some paragraphs word for word (e.g. Item 1 and Item 8
++    both describe component supply). Each copy is its own chunk, and two
++    copies took two of the six final slots. Keep the first, i.e. the one
++    ranked higher by the searches."""
++    seen: set[str] = set()
++    out = []
++    for c in candidates:
++        key = " ".join(c.chunk.text.split()).lower()
++        if key not in seen:
++            seen.add(key)
++            out.append(c)
++    return out
+\ No newline at end of file
+diff --git a/tests/test_pipeline.py b/tests/test_pipeline.py
+index 5941345..be7fd0a 100644
+--- a/tests/test_pipeline.py
++++ b/tests/test_pipeline.py
+@@ -283,3 +283,80 @@ def test_a_refusal_from_layer_4_is_passed_through(world):
+     world([passages("a1", 0.05)])
+     a = gen.answer("FY2027 projections?")
+     assert not a.answered and "relevant chunk" in a.text
++
++
++# --- citation markers in the answer text ---------------------------------------
++# Eval run on 5c78bb0: EPS, operating cash and iPhone revenue had the right
++# number, [S1] in the citations list, but no marker in the text - and HIGH.
++
++
++def test_one_sentence_answer_without_markers_gets_its_citations(world):
++    world([passages("a1", 0.1)], facts=[fact("iPhone", 209_586e6)],
++          groq=FakeGroq(fact_grades={"iPhone": 0.9},
++                        answer={"answerable": True, "answer": "$209,586,000,000.", "citations": ["[S1]"]}))
++    a = gen.answer("iPhone revenue FY2025?")
++    assert a.text == "$209,586,000,000 [S1].", "a single sentence can only come from its cited sources"
++    assert a.confidence.band == "high"
++
++
++def test_longer_answer_without_markers_is_kept_below_high(world):
++    world([passages("a1", 0.1)], facts=[fact("Net income", 112_010e6)],
++          groq=FakeGroq(fact_grades={"Net income": 0.9},
++                        answer={"answerable": True,
++                                "answer": "Net income was $112,010,000,000. That was a record year.",
++                                "citations": ["[S1]"]}))
++    a = gen.answer("net income FY2025?")
++    assert "[S1]" not in a.text, "with two sentences we can't tell which one the source backs"
++    assert a.confidence.band != "high"
++    assert any("not tied to" in n for n in a.confidence.notes)
++
++
++def test_answer_with_markers_is_left_alone(world):
++    world([passages("a1", 0.1)], facts=[fact("Net income", 112_010e6)],
++          groq=FakeGroq(fact_grades={"Net income": 0.9},
++                        answer={"answerable": True, "answer": "Net income was $112,010,000,000 [S1].",
++                                "citations": ["[S1]"]}))
++    a = gen.answer("net income FY2025?")
++    assert a.text == "Net income was $112,010,000,000 [S1]." and a.confidence.band == "high"
++
++
++
++# --- the number check ------------------------------------------------------------
++# Eval run: two correct answers were capped LOW (0.44) as "number not found".
++
++
++def _no_number_warning(a) -> bool:
++    return not any("not found in cited sources" in n for n in a.confidence.notes)
++
++
++def test_figures_restated_in_millions_are_recognised(world):
++    facts = [fact("Total assets", 359_241e6, "balance_sheet"),
++             fact("Total liabilities", 285_508e6, "balance_sheet"),
++             fact("Total shareholders equity", 73_733e6, "balance_sheet")]
++    world([passages("a1", 0.1)], facts=facts,
++          groq=FakeGroq(fact_grades={"Total": 0.9}, answer={
++              "answerable": True, "citations": ["[S1]", "[S2]", "[S3]"],
++              "answer": "Yes, total assets of $359,241,000,000 [S1] equal total liabilities of "
++                        "$285,508,000,000 [S2] plus total shareholders' equity of $73,733,000,000 [S3] "
++                        "(285,508 + 73,733 = 359,241)."}))
++    a = gen.answer("Does the balance sheet balance?")
++    assert _no_number_warning(a) and a.confidence.band == "high"
++
++
++def test_differences_of_passage_numbers_are_allowed(world):
++    p = passages("a1", 0.9, 0.9)
++    # "grade=0.9" is what the fake grader reads, so the passage stays relevant.
++    p[0].chunk.text = "Wearables, Home and Accessories net sales were $35,686 in 2025 and $37,005 in 2024. grade=0.9"
++    world([p], groq=FakeGroq(answer={
++        "answerable": True, "citations": ["[1]"],
++        "answer": "Net sales fell from $37,005 in 2024 to $35,686 in 2025, a decrease of $1,319 [1]."}))
++    a = gen.answer("Why did Wearables net sales decrease?")
++    assert _no_number_warning(a)
++
++
++def test_a_wrong_number_is_still_caught(world):
++    world([passages("a1", 0.1)], facts=[fact("Net income", 112_010e6)],
++          groq=FakeGroq(fact_grades={"Net income": 0.9}, answer={
++              "answerable": True, "citations": ["[S1]"], "answer": "Net income was $11.2 billion [S1]."}))
++    a = gen.answer("net income FY2025?")
++    assert not _no_number_warning(a) and a.confidence.band == "low"
+diff --git a/tests/test_retrieval.py b/tests/test_retrieval.py
+new file mode 100644
+index 0000000..2e645cc
+--- /dev/null
++++ b/tests/test_retrieval.py
+@@ -0,0 +1,91 @@
++"""Tests for Layer 3's final ranking, with the searches and the reranker
++replaced by stand-ins - offline, no models, no index.
++
++Why this file exists: for "What risks does Apple disclose related to tariffs?"
++both searches ranked the MD&A tariff passages near the top (vector #2,
++BM25 #4), but the reranker scored them ~0.0005 - below an unrelated
++credit-risk passage - and, as the only judge of the final 6, cut them.
++
++Run from the project root:   pytest
++"""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++
++import pytest
++
++import dd.retrieval as ret
++from dd.config import get_config
++from dd.models import Chunk
++
++
++def chunk(cid: str, text: str | None = None) -> Chunk:
++    return Chunk(chunk_id=cid, text=text or f"text of {cid}", company="Apple Inc.",
++                 ticker="AAPL", form="10-K", fiscal_year="FY2025", item="Item 1A",
++                 section="Risk Factors")
++
++
++@pytest.fixture
++def world(monkeypatch):
++    """setup(dense ids, bm25 ids, reranker scores by id, optional chunk texts)"""
++    def setup(dense, sparse, rerank_scores, texts=None):
++        texts = texts or {}
++        ids = dict.fromkeys(dense + sparse)
++        monkeypatch.setattr(ret, "dense_search", lambda q, cfg, k: [(c, 1.0) for c in dense])
++        monkeypatch.setattr(ret, "sparse_search", lambda q, cfg, k: [(c, 1.0) for c in sparse])
++        monkeypatch.setattr(ret, "read_chunks", lambda path: [chunk(c, texts.get(c)) for c in ids])
++
++        def predict(pairs, batch_size):
++            # the chunk id is in the text the reranker reads
++            return [next(s for c, s in rerank_scores.items()
++                         if t.endswith(texts.get(c, f"text of {c}")))
++                    for _, t in pairs]
++        monkeypatch.setattr(ret, "get_reranker", lambda name: SimpleNamespace(predict=predict))
++    return setup
++
++
++def ids(results) -> list[str]:
++    return [r.chunk.chunk_id for r in results]
++
++
++def test_reranker_alone_cannot_drop_what_both_searches_rank_highly(world):
++    # "tariffs" is #2 in both searches; the reranker scores it lowest of all.
++    # Six filler passages the reranker likes more, found by only one search.
++    fillers = [f"f{i}" for i in range(6)]
++    world(dense=["a", "tariffs", *fillers[:3]],
++          sparse=["a", "tariffs", *fillers[3:]],
++          rerank_scores={"a": 0.9, "tariffs": 0.0004, **{f: 0.01 for f in fillers}})
++    top = ids(ret.hybrid_retrieve("tariff risks?", get_config()))
++    assert len(top) == get_config().retrieval.final_top_k
++    assert "tariffs" in top, "both searches agreed on it - the reranker gets a vote, not a veto"
++
++
++def test_reranker_still_decides_between_otherwise_equal_passages(world):
++    # Same search ranks for x and y (each found by one search at #2): the
++    # reranker's opinion breaks the tie.
++    world(dense=["a", "x"], sparse=["a", "y"], rerank_scores={"a": 0.9, "x": 0.1, "y": 0.8})
++    assert ids(ret.hybrid_retrieve("q?", get_config())) == ["a", "y", "x"]
++
++
++def test_identical_passages_take_only_one_slot(world):
++    same = "Although most components essential to the Company's business are generally available."
++    world(dense=["item1", "item8", "b"], sparse=["item1", "item8", "b"],
++          rerank_scores={"item1": 0.5, "item8": 0.5, "b": 0.4},
++          texts={"item1": same, "item8": "  " + same.replace(" ", "  "), "b": "text of b"})
++    assert ids(ret.hybrid_retrieve("components?", get_config())) == ["item1", "b"]
++
++
++def test_passages_only_one_search_likes_cannot_outvote_the_reranker(world):
++    # Cybersecurity question: each search had boilerplate at #2 ("Available
++    # Information", a different chunk in each), and the reranker rightly put
++    # the real risk passages first. Giving the searches a vote let five
++    # boilerplate passages in and the question was refused.
++    # As in the real probe, the risk passages are found by vector search only
++    # (#4-#9) and each search has its own boilerplate at the top.
++    relevant = [f"risk{i}" for i in range(6)]
++    world(dense=["junk_d1", "junk_d2", "junk_d3", *relevant],
++          sparse=["junk_s1", "junk_s2", "junk_s3"],
++          rerank_scores={**{r: 0.9 for r in relevant},
++                         **{j: 0.001 for j in ["junk_d1", "junk_d2", "junk_d3", "junk_s1", "junk_s2", "junk_s3"]}})
++    assert sorted(ids(ret.hybrid_retrieve("cybersecurity risks?", get_config()))) == relevant
