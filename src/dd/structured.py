@@ -27,6 +27,11 @@ CANONICAL_LABELS: dict[str, list[tuple[str, list[str]]]] = {
         ("Provision for income taxes", ["income tax", "provision for income taxes", "tax expense"]),
         ("Diluted (in dollars per share)", ["diluted eps", "diluted earnings per share"]),
         ("Basic (in dollars per share)", ["basic eps", "basic earnings per share"]),
+        # Weighted-average share counts behind EPS. Asked from the 10-K's own
+        # table instead, the answer once took the wrong year's column and
+        # lost the table's "in thousands".
+        ("Diluted (in shares)", ["diluted share"]),
+        ("Basic (in shares)", ["basic share"]),
         ("iPhone", ["iphone revenue", "iphone"]),
         ("Mac", ["mac revenue", "mac"]),
         ("iPad", ["ipad revenue", "ipad"]),
@@ -72,7 +77,7 @@ AMBIGUOUS_LABEL_CONCEPT_HINTS: dict[str, str] = {
 # net sales, and for a region nothing. "iPhone gross margin" must not fetch
 # Gross margin: the number is real, so nothing later would flag it as the
 # answer to a different question.
-_SEGMENT_LABELS = {"iPhone", "Mac", "iPad", "Wearables, Home and Accessories", "Services"}
+SEGMENT_LABELS = {"iPhone", "Mac", "iPad", "Wearables, Home and Accessories", "Services"}
 _SEGMENT = (
     r"(?:iphone|mac|ipad|wearables|accessories|services|products"
     r"|americas|europe|greater china|japan|rest of asia pacific)s?"
@@ -146,11 +151,15 @@ def _segment_scope(q: str, start: int, end: int) -> tuple[int, int] | None:
     return None
 
 
-def _segment_mentions(q: str) -> list[tuple[int, int]]:
-    """Products or regions the question is about: "how much gross margin did
-    the iphone make". Not "iphone revenue", which asks for the product's
-    own net sales."""
-    return [m.span() for m in _SEGMENT_RE.finditer(q) if not _SALES_AFTER_RE.match(q, m.end())]
+def segments_mentioned(query: str) -> list[str]:
+    """Products or regions a question mentions other than as "iphone
+    revenue" (which asks for the product's own net sales): "how much gross
+    margin did the iphone make", "tariffs in europe". Wording alone can't
+    tell whether a company-wide figure is still wanted, so Layer 5 keeps
+    such an answer below HIGH instead of the figure being dropped here."""
+    q = _normalize(query)
+    names = [m.group(0) for m in _SEGMENT_RE.finditer(q) if not _SALES_AFTER_RE.match(q, m.end())]
+    return list(dict.fromkeys(names))
 
 
 def match_structured_query(query: str, fuzzy_cutoff: float = 0.72) -> list[StructuredMatch]:
@@ -186,21 +195,15 @@ def match_structured_query(query: str, fuzzy_cutoff: float = 0.72) -> list[Struc
     # A measure limited to one product or region isn't in the database. Drop
     # it, and the product too: iPhone revenue doesn't answer iPhone gross
     # margin. Net sales is the exception, because a product's row IS its net
-    # sales, so only the company-wide total goes - and only when the product
-    # is right beside it: "iPhone's share of net sales" needs the total.
-    mentions = _segment_mentions(q)
-    for h in [h for h in kept if h[3] not in _SEGMENT_LABELS]:
+    # sales, so only the company-wide total goes. Only a product or region
+    # right beside the measure counts: elsewhere ("tariffs in Europe ... gross
+    # margin") the total may be what's wanted - see segments_mentioned().
+    for h in [h for h in kept if h[3] not in SEGMENT_LABELS]:
         scope = _segment_scope(q, h[0], h[1])
-        if h[3] == "Net sales":
-            if scope:
-                kept.remove(h)
-            continue
-        # Anywhere in the question counts, not just beside the measure: a
-        # wrong figure answers a different question, a missing one is refused.
-        spans = [scope] if scope else mentions
-        if spans and h in kept:
+        if scope and h in kept:
             kept.remove(h)
-            kept = [o for o in kept if not any(o[0] < e and s < o[1] for s, e in spans)]
+            if h[3] != "Net sales":
+                kept = [o for o in kept if not (o[0] < scope[1] and scope[0] < o[1])]
 
     # Checks hits, not kept: with everything dropped above, the fuzzy pass
     # below would fetch the same company-wide figure again.
@@ -358,6 +361,8 @@ def describe_fact(fact: dict) -> str:
     size = abs(value)
     if "per share" in fact["label"]:
         amount = f"${size:,.2f} per share"
+    elif "(in shares)" in fact["label"]:
+        amount = f"{size:,.0f} shares"
     elif size % 1e6 == 0:
         amount = f"${size / 1e6:,.0f} million"
     else:  # not a whole number of millions - write it out rather than round it

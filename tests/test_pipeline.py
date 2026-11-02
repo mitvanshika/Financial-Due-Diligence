@@ -25,7 +25,7 @@ import dd.generation as gen
 import dd.self_healing as sh
 from dd.config import get_config
 from dd.models import Chunk, RetrievedChunk
-from dd.structured import describe_fact, match_structured_query
+from dd.structured import describe_fact, match_structured_query, segments_mentioned
 
 CFG = get_config().self_healing
 
@@ -399,6 +399,7 @@ def test_a_database_figure_without_its_millions_is_caught(world):
     ("Net income", 112_010e6, "income_statement", "$112,010 million"),
     ("Diluted (in dollars per share)", 7.46, "income_statement", "$7.46 per share"),
     ("Cash used in financing activities", -120_686e6, "cash_flow", "-$120,686 million"),
+    ("Diluted (in shares)", 15_004_697_000.0, "income_statement", "15,004,697,000 shares"),
     ("Odd amount", 1_234_567.0, "balance_sheet", "$1,234,567"),
 ])
 def test_database_figures_are_described_in_millions_like_the_filing(label, value, table, written):
@@ -413,9 +414,10 @@ def test_database_figures_are_described_in_millions_like_the_filing(label, value
     ("iPhone gross margin", []),  # the fuzzy pass must not fetch it instead
     ("What was Products gross margin in FY2025?", []),
     ("What was Greater China net sales in FY2025?", []),
-    # ...wherever in the question the product or region is.
-    ("How much gross margin did the iPhone make in FY2025?", []),
-    ("What did Japan contribute to operating income in FY2025?", []),
+    # Elsewhere in the question, the total may be what's wanted: it's fetched,
+    # and Layer 5 keeps an answer resting on it below HIGH (tests below).
+    ("How much gross margin did the iPhone make in FY2025?", ["Gross margin", "iPhone"]),
+    ("How do tariffs in Europe affect Apple's gross margin in FY2025?", ["Gross margin"]),
     # A product's row is its net sales: only the company-wide total goes.
     ("What were Services net sales in FY2025?", ["Services"]),
     ("What were net sales of the iPhone in FY2025?", ["iPhone"]),
@@ -431,6 +433,40 @@ def test_a_measure_limited_to_one_product_or_region_fetches_no_company_figure(qu
     assert found == labels
 
 
+@pytest.mark.parametrize("question, named", [
+    ("How do tariffs in Europe affect Apple's gross margin in FY2025?", ["europe"]),
+    ("How much gross margin did the iPhone make in FY2025?", ["iphone"]),
+    ("Why did Services net sales increase in FY2025?", []),  # the product's own net sales
+    ("Did Apple's Services revenue grow faster than its iPhone revenue?", []),
+])
+def test_products_and_regions_a_question_is_about(question, named):
+    assert segments_mentioned(question) == named
+
+
+def _company_wide_answer(world, question: str, facts: list[dict], answer: str, citations: list[str]):
+    world([passages("a1", 0.1)], facts=facts,
+          groq=FakeGroq(fact_grades={"Gross margin": 0.9, "iPhone": 0.9, "Net sales": 0.9},
+                        answer={"answerable": True, "citations": citations, "answer": answer}))
+    return gen.answer(question)
+
+
+def test_a_company_wide_figure_for_a_question_about_a_region_is_not_high(world):
+    a = _company_wide_answer(
+        world, "How do tariffs in Europe affect Apple's gross margin in FY2025?",
+        [fact("Gross margin", 195_201e6)], "Gross margin was $195,201 million [S1].", ["[S1]"])
+    assert a.answered and a.confidence.band != "high"
+    assert any("question is about europe" in n and "company-wide" in n for n in a.confidence.notes)
+
+
+def test_a_company_wide_figure_beside_the_products_own_is_fine(world):
+    a = _company_wide_answer(
+        world, "What was iPhone's share of net sales in FY2025?",
+        [fact("iPhone", 209_586e6), fact("Net sales", 416_161e6)],
+        "iPhone revenue was $209,586 million [S1] of $416,161 million net sales [S2].", ["[S1]", "[S2]"])
+    assert a.confidence.band == "high"
+    assert not any("company-wide" in n for n in a.confidence.notes)
+
+
 @pytest.mark.parametrize("question, labels", [
     ("What was iPhone's revenue in FY2025?", ["iPhone"]),
     ("What was iPhone’s revenue in FY2025?", ["iPhone"]),
@@ -444,6 +480,34 @@ def test_possessives_and_plurals_match_their_figure(question, labels):
     whole-word match for "iphone" used to miss - so no figure was fetched."""
     found = list(dict.fromkeys(m.label for m in match_structured_query(question)))
     assert found == labels
+
+
+@pytest.mark.parametrize("question, labels", [
+    ("How many diluted shares did Apple have in FY2025?", ["Diluted (in shares)"]),
+    ("What was Apple's diluted share count in FY2025?", ["Diluted (in shares)"]),
+    ("What was Apple's basic share count in FY2025?", ["Basic (in shares)"]),
+    ("What was Apple's diluted EPS in FY2025?", ["Diluted (in dollars per share)"]),
+    ("How did stock buybacks affect diluted shareholders in FY2025?", ["Repurchases of common stock"]),
+])
+def test_share_counts_are_matched_apart_from_eps(question, labels):
+    found = list(dict.fromkeys(m.label for m in match_structured_query(question)))
+    assert found == labels
+
+
+@pytest.mark.parametrize("answer, ok", [
+    ("Apple had 15,004,697,000 diluted shares [S1].", True),
+    ("Apple had about 15.00 billion diluted shares [S1].", True),
+    ("Apple had 15,004,697 thousand diluted shares [S1].", True),
+    ("Apple had 15,004,697 diluted shares [S1].", False),  # the table's figure without "thousand"
+    ("Apple had 15,812,547 thousand diluted shares [S1].", False),  # FY2023's figure
+])
+def test_share_count_answers_are_checked_with_their_unit(world, answer, ok):
+    shares = {**fact("Diluted (in shares)", 15_004_697_000.0), "label": "Diluted (in shares)"}
+    world([passages("a1", 0.1)], facts=[shares],
+          groq=FakeGroq(fact_grades={"Diluted (in shares)": 0.9},
+                        answer={"answerable": True, "citations": ["[S1]"], "answer": answer}))
+    a = gen.answer("How many diluted shares did Apple have in FY2025?")
+    assert _no_number_warning(a) is ok
 
 
 def test_an_answer_in_millions_matches_the_stored_value(world):

@@ -32,7 +32,7 @@ from .models import (
     RetrievalOutcome,
 )
 from .self_healing import ProgressFn, emit, get_groq_client, self_heal
-from .structured import describe_fact
+from .structured import SEGMENT_LABELS, describe_fact, segments_mentioned
 
 # --- Step 1: lay out the evidence with markers -----------------------------
 
@@ -108,8 +108,11 @@ revenue in dollars does not answer a question about units sold).
 - If the evidence does not answer the question, set "answerable" to false \
 and use "answer" to say briefly what is missing.
 - Be concise. State numbers exactly as given, always with their unit. \
-Financial tables in a 10-K are often stated "in millions" - if the evidence \
-says so, say so (e.g. "$73,733 million"), never a bare number."""
+Dollar amounts in a 10-K's financial tables are in millions unless the table \
+says otherwise, even where a passage doesn't repeat "(in millions)": write a \
+table's 12,345 as "$12,345 million", never "$12,345". Per-share amounts are \
+in dollars ("$7.46 per share"). Share counts are not dollars: give them in the \
+unit their table states."""
 
 
 def _ask_model(question: str, evidence: str, cfg: Config) -> dict:
@@ -186,13 +189,14 @@ def _check_citations(
 
 # --- Step 4: check the numbers ----------------------------------------------
 
-# A number, optionally with $ in front and million/billion/% after ("M" and
-# "B" too: "$112,887M"). Not preceded by a letter or digit, so "FY2025", "Q2"
-# and "[S1]" aren't read as numbers.
+# A number, optionally with $ in front and thousand/million/billion/% after
+# ("M" and "B" too: "$112,887M"; share counts are tabled "in thousands").
+# Not preceded by a letter or digit, so "FY2025", "Q2" and "[S1]" aren't
+# read as numbers.
 _NUM_RE = re.compile(
-    r"(?<![A-Za-z\d.,])(\$?)(\d[\d,]*(?:\.\d+)?)\s*(million|billion|bn\b|[mb]\b|%)?", re.IGNORECASE
+    r"(?<![A-Za-z\d.,])(\$?)(\d[\d,]*(?:\.\d+)?)\s*(thousand|million|billion|bn\b|[mb]\b|%)?", re.IGNORECASE
 )
-_SCALE = {"million": 1e6, "billion": 1e9, "m": 1e6, "b": 1e9, "bn": 1e9}
+_SCALE = {"thousand": 1e3, "million": 1e6, "billion": 1e9, "m": 1e6, "b": 1e9, "bn": 1e9}
 
 
 def _numbers(text: str) -> list[tuple[float, float, str]]:
@@ -324,7 +328,8 @@ def _repeats_a_figure(g: GradedChunk, facts: list[dict]) -> bool:
     ("112,010" for $112,010,000,000)? Then it backs that figure up instead
     of adding anything of its own.
     """
-    targets = [abs(f["value"]) / scale for f in facts if f["value"] for scale in (1, 1e6, 1e9)]
+    # Thousands too: share counts are tabled "in thousands".
+    targets = [abs(f["value"]) / scale for f in facts if f["value"] for scale in (1, 1e3, 1e6, 1e9)]
     for d in re.findall(r"\d[\d,]*(?:\.\d+)?", g.retrieved.chunk.text):
         d = d.rstrip(",.")
         n = float(d.replace(",", ""))
@@ -413,6 +418,20 @@ def _confidence(
     if _clean_facts(outcome) and not cited_facts:
         score = min(score, bands.high - 0.01)
         notes.append("answer ignored the database figures it was given")
+
+    # The question names a product or region, but the answer rests on
+    # company-wide figures alone: right if the total is what was wanted
+    # ("tariffs in Europe ... gross margin"), wrong if it stands in for the
+    # product's own ("how much gross margin did the iPhone make"). Wording
+    # can't tell which, so say so instead of calling it HIGH.
+    named = segments_mentioned(outcome.original_query)
+    company_wide = [f["label"] for f in cited_facts if f["label"] not in SEGMENT_LABELS]
+    if named and company_wide and len(company_wide) == len(cited_facts):
+        score = min(score, bands.high - 0.01)
+        notes.append(
+            f"question is about {', '.join(named)}, but {', '.join(dict.fromkeys(company_wide))} "
+            "is Apple's company-wide total - check it answers what was asked"
+        )
 
     # Every number must match something the answer cites. If one doesn't,
     # the answer is still shown, but marked LOW - never quietly trusted.
