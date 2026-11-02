@@ -157,10 +157,14 @@ def parse_blocks(text: str) -> list[Block]:
         buf_kind = "prose"
 
     def table_follows(i: int) -> bool:
-        """Is the next non-blank line a table line?"""
+        """Does a table line come next, past blanks and other indented lines?
+        A column heading can take several lines ("Number of / RSUs / (in
+        thousands)"); only its last one is directly above the table."""
         for j in range(i + 1, min(i + 6, len(lines))):
-            if lines[j].strip():
-                return _is_table_line(lines[j])
+            if _is_table_line(lines[j]):
+                return True
+            if lines[j].strip() and not lines[j][:1].isspace():
+                return False
         return False
 
     for i in range(start, len(lines)):
@@ -213,7 +217,9 @@ def parse_blocks(text: str) -> list[Block]:
         if not buf:
             buf_start = offsets[i]
             buf_kind = kind
-        buf.append(line if kind == "table" else stripped)
+        # Prose keeps no layout either: a two-column passage in the auditor's
+        # report reads "How We Addressed the      We tested controls...".
+        buf.append(line if kind == "table" else re.sub(r" {2,}", " ", stripped))
 
     flush()
     return blocks

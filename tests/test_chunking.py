@@ -29,8 +29,9 @@ from dd.config import ChunkingCfg, filing_text_path, get_config
 # --- group 1: the real filing ---------------------------------------------
 
 # 385 before tables were kept whole with their headers: the statements had
-# been cut into many headerless fragments.
-EXPECTED_CHUNK_COUNT = 344
+# been cut into many headerless fragments. 344 until a table's column heading
+# spanning several lines was kept with it (the RSU table).
+EXPECTED_CHUNK_COUNT = 343
 
 EXPECTED_ITEMS = {
     "Item 1", "Item 1A", "Item 1C", "Item 2", "Item 3", "Item 5", "Item 7",
@@ -164,13 +165,27 @@ def test_statement_rows_carry_title_units_and_years(chunks, row, title, units, y
     assert years in text.split(row)[0], f"no year row above {row!r}"
 
 
-def test_tables_have_no_padding_and_fit_the_reranker(chunks):
+def test_no_padding_and_tables_fit_the_reranker(chunks):
+    """18% of all indexed text used to be column padding and ─── rules,
+    sent to Groq in every prompt; one chunk was 197 characters of content
+    in 1,162."""
     cfg = get_config().chunking
     tables = [c for c in chunks if " | " in c.text]
     assert all(len(c.text) <= cfg.table_max_chars for c in tables)
     assert not [c.chunk_id for c in chunks if ch.TABLE_RULE_RE.search(c.text)], "rules left in chunk text"
-    padded = [c.chunk_id for c in tables if re.search(r" {3,}", c.text)]
-    assert not padded, f"column padding left in table pieces: {padded[:5]}"
+    padded = [c.chunk_id for c in chunks if re.search(r" {2,}", c.text)]
+    assert not padded, f"runs of spaces left in chunks: {padded[:5]}"
+
+
+def test_a_column_heading_over_several_lines_stays_with_its_table(chunks):
+    text = _piece_with(chunks, "RSUs granted | 73,466 | $226.68")
+    assert text.split("\n")[:5] == [
+        "Restricted Stock Units",
+        "A summary of the Company’s RSU activity and related information for 2025 is as follows:",
+        "Number of | Weighted-Average",
+        "RSUs | Grant-Date Fair",
+        "(in thousands) | Value Per RSU",
+    ]
 
 
 def test_excluded_items_are_absent(chunks):
