@@ -275,8 +275,18 @@ def serve(
 
     import uvicorn
 
-    from .config import DATA_DIR
-    from .server import WEB_DIST, create_app
+    from .config import DATA_DIR, get_secrets
+    from .server import WEB_DIST, check_startup, create_app
+
+    # Never printed: only whether it is set.
+    code = get_secrets().room_access_code
+    try:
+        warning = check_startup(host, code)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(1)
+    if warning:
+        console.print(f"[yellow]{warning}[/]")
 
     if not WEB_DIST.exists():
         console.print("[yellow]the web app isn't built yet[/] - run: cd web; npm install; npm run build")
@@ -297,7 +307,10 @@ def serve(
     # One worker process: the room's state lives in memory, so every browser
     # must reach the same process.
     # The state file keeps history and finished actions across restarts.
-    uvicorn.run(create_app(state_file=DATA_DIR / "room_state.json"), host=host, port=port, workers=1)
+    uvicorn.run(
+        create_app(state_file=DATA_DIR / "room_state.json", access_code=code),
+        host=host, port=port, workers=1,
+    )
 
 
 def _print_answer(a) -> None:

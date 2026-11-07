@@ -16,8 +16,8 @@ Rules the team chose:
 - An action needs EVERY person present to approve it; one rejection stops it.
   The voters are the people in the room when it was proposed; someone who
   leaves is no longer waited on, someone who joins later does not vote.
-- People identify themselves by typing a display name. No passwords - run
-  this on a trusted network.
+- People identify themselves by typing a display name. Getting in takes the
+  room's one shared access code (server.py); there are no per-person accounts.
 
 Concurrency: one asyncio event loop owns all room state, so no locks are
 needed around it. The pipeline and the actions are slow, blocking calls, so
