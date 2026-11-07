@@ -21,8 +21,9 @@ RUN grep -v '^-e' requirements.txt > /tmp/requirements-deps.txt \
 
 # 2. Download the two models into the image, so a new container starts fast.
 RUN python -c "from huggingface_hub import snapshot_download; \
-snapshot_download('BAAI/bge-small-en-v1.5'); \
-snapshot_download('BAAI/bge-reranker-large')"
+skip = ['*.bin', '*.onnx', '*.onnx_data', 'onnx/*', '*.h5', '*.msgpack', '*.ot', 'openvino/*']; \
+snapshot_download('BAAI/bge-small-en-v1.5', ignore_patterns=skip); \
+snapshot_download('BAAI/bge-reranker-large', ignore_patterns=skip)"
 
 # 3. The code, the raw filing and tables, and the built web page.
 COPY pyproject.toml config.yaml build_financials_db.py ./
