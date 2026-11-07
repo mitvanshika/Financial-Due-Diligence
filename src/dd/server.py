@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
@@ -63,8 +65,18 @@ async def _handle(room: Room, member_id: str, msg: dict[str, Any]) -> None:
         raise ValueError(f"unknown message type '{kind}'")
 
 
-def create_app() -> FastAPI:
-    room = Room()
+def _from_own_page(ws: WebSocket) -> bool:
+    """A browser tags a WebSocket with the address of the page that opened it.
+    Only our own page may join: otherwise any website open in a team member's
+    browser could connect to a room on localhost, ask questions and vote.
+    No Origin header = not a browser page (scripts, tests): allowed, because
+    this check protects people's browsers, not the network."""
+    origin = ws.headers.get("origin")
+    return origin is None or urlsplit(origin).netloc == ws.headers.get("host", "")
+
+
+def create_app(state_file: Path | None = None) -> FastAPI:
+    room = Room(state_file=state_file)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -81,6 +93,9 @@ def create_app() -> FastAPI:
 
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket) -> None:
+        if not _from_own_page(ws):
+            await ws.close(code=1008)  # policy violation
+            return
         await ws.accept()
         member_id: str | None = None
         try:
@@ -104,7 +119,7 @@ def create_app() -> FastAPI:
             pass
         finally:
             if member_id is not None:
-                await room.leave(member_id)
+                await room.disconnect(member_id, ws)
 
     if WEB_DIST.exists():
         app.mount("/", StaticFiles(directory=WEB_DIST, html=True), name="web")

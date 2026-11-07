@@ -60,7 +60,7 @@ def _build_evidence(
         marker = f"[{i}]"
         lookup[marker] = g
         c = g.retrieved.chunk
-        lines.append(f"{marker} ({c.item} / {c.subsection})\n{c.text}")
+        lines.append(f"{marker} ({c.item} / {c.subsection or c.section})\n{c.text}")
 
     for i, fact in enumerate(facts, start=1):
         marker = f"[S{i}]"
@@ -459,11 +459,14 @@ def _confidence(
 
 def _model_failed(query: str, exc: Exception, outcome: RetrievalOutcome | None = None) -> Answer:
     """A rate limit, an outage or an unreadable reply is said plainly
-    instead of crashing the command."""
+    instead of crashing the command. The first line of the error is kept: the
+    type alone ("OSError") doesn't say whether it was a rate limit or a model
+    that wouldn't load."""
+    detail = next(iter(str(exc).strip().splitlines()), "")[:200]
     return Answer(
         query=query,
         answered=False,
-        text=f"Model call failed ({type(exc).__name__}). Try again in a minute.",
+        text=f"Model call failed ({type(exc).__name__}{': ' + detail if detail else ''}). Try again in a minute.",
         outcome=outcome,
     )
 

@@ -206,6 +206,32 @@ def act(
 
 
 @app.command()
+def flags() -> None:
+    """Layer 6: list the review flags still waiting for a reviewer."""
+    from .actions import open_flags
+
+    rows = open_flags()
+    if not rows:
+        console.print("no open review flags")
+    for e in rows:
+        console.print(f"[cyan]{e['id']}[/] [{e['priority']}] {e['question']}\n    {e['reason']}")
+
+
+@app.command("close-flag")
+def close_flag_command(
+    flag_id: str,
+    note: str = typer.Option("", help="what the reviewer found or decided"),
+) -> None:
+    """Layer 6: mark a review flag as reviewed (the question can then be flagged again)."""
+    from .actions import close_flag
+
+    try:
+        console.print(close_flag(flag_id, note))
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/]")
+
+
+@app.command()
 def session() -> None:
     """Load the models once, then answer questions until you type 'exit'."""
     from .actions import ACTIONS
@@ -249,6 +275,7 @@ def serve(
 
     import uvicorn
 
+    from .config import DATA_DIR
     from .server import WEB_DIST, create_app
 
     if not WEB_DIST.exists():
@@ -269,7 +296,8 @@ def serve(
     )
     # One worker process: the room's state lives in memory, so every browser
     # must reach the same process.
-    uvicorn.run(create_app(), host=host, port=port, workers=1)
+    # The state file keeps history and finished actions across restarts.
+    uvicorn.run(create_app(state_file=DATA_DIR / "room_state.json"), host=host, port=port, workers=1)
 
 
 def _print_answer(a) -> None:
