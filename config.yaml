@@ -21,6 +21,12 @@ chunking:
   # complaining, so anything longer is embedding text that silently never gets
   # read. Wide financial tables are the usual offender; they get row-split.
   max_chars: 2000
+  # Ceiling for a table piece, header included. Numbers cost more tokens than
+  # words (down to ~2.5 characters per token), and the reranker reads the
+  # question and a "[SEC 10-K filing, Item 8 - ...]" label in the same 512
+  # tokens. Measured with the longest eval question: 1000 tops out at 436
+  # tokens; 1100 reached 511 and 1250 went over, cutting rows off unseen.
+  table_max_chars: 1000
   # Items with no retrieval value that actively pollute the keyword index.
   # Item 15 is the exhibit index: hundreds of filing numbers and dates that
   # match numeric queries and crowd out real content.
