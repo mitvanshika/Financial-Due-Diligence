@@ -8,13 +8,13 @@
           "name": "2025 tariffs and the countries named",
           "any_of": [
             "AAPL-10-K-FY2025-0037",
-            "AAPL-10-K-FY2025-0181"
+            "AAPL-10-K-FY2025-0173"
           ]
         },
         {
           "name": "cost / supply-chain impact of tariffs",
           "any_of": [
-            "AAPL-10-K-FY2025-0182",
+            "AAPL-10-K-FY2025-0174",
             "AAPL-10-K-FY2025-0038",
             "AAPL-10-K-FY2025-0034"
           ]
@@ -55,7 +55,7 @@
         {
           "name": "MD&A reason for the decrease",
           "any_of": [
-            "AAPL-10-K-FY2025-0195"
+            "AAPL-10-K-FY2025-0187"
           ]
         }
       ]
@@ -66,7 +66,7 @@
         {
           "name": "MD&A reason for the increase",
           "any_of": [
-            "AAPL-10-K-FY2025-0196"
+            "AAPL-10-K-FY2025-0188"
           ]
         }
       ]
@@ -99,7 +99,7 @@
         {
           "name": "MD&A Products gross margin explanation",
           "any_of": [
-            "AAPL-10-K-FY2025-0203"
+            "AAPL-10-K-FY2025-0191"
           ]
         }
       ]
@@ -110,7 +110,7 @@
         {
           "name": "one-time $10.2B State Aid tax charge in Q4 FY2024",
           "any_of": [
-            "AAPL-10-K-FY2025-0371"
+            "AAPL-10-K-FY2025-0293"
           ]
         }
       ]
