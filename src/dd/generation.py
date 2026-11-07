@@ -117,25 +117,38 @@ unit their table states."""
 
 def _ask_model(question: str, evidence: str, cfg: Config) -> dict:
     client = get_groq_client(cfg)
-    resp = client.chat.completions.create(
-        model=cfg.generation.model,
-        messages=[
-            {
-                "role": "user",
-                "content": _ANSWER_PROMPT.format(question=question, evidence=evidence),
-            }
-        ],
-        max_tokens=cfg.generation.max_tokens,
-        temperature=cfg.generation.temperature,
-        reasoning_effort=cfg.generation.effort,
-        response_format={
-            "type": "json_schema",
-            # strict: Groq guarantees the reply matches the schema.
-            "json_schema": {"name": "grounded_answer", "schema": _ANSWER_SCHEMA, "strict": True},
-        },
-    )
+    last_exc = None
+    # Groq sometimes rejects the call itself with 400 "json_validate_failed"
+    # (the model wrote JSON that does not match the schema). A retry at the same
+    # temperature tends to repeat the mistake, so the second try changes it.
+    # After two failures the error goes up and the caller says so plainly.
+    for temperature in (cfg.generation.temperature, 0.5):
+        try:
+            resp = client.chat.completions.create(
+                model=cfg.generation.model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": _ANSWER_PROMPT.format(question=question, evidence=evidence),
+                    }
+                ],
+                max_tokens=cfg.generation.max_tokens,
+                temperature=temperature,
+                reasoning_effort=cfg.generation.effort,
+                response_format={
+                    "type": "json_schema",
+                    # strict: Groq guarantees the reply matches the schema.
+                    "json_schema": {"name": "grounded_answer", "schema": _ANSWER_SCHEMA, "strict": True},
+                },
+            )
+            break
+        except Exception as exc:  # noqa: BLE001 - re-raised unless it is this one error
+            if "json_validate_failed" not in str(exc):
+                raise
+            last_exc = exc
+    else:
+        raise last_exc
     return json.loads(resp.choices[0].message.content)
-
 
 # --- Step 3: check which citations are real ---------------------------------
 

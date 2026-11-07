@@ -6,7 +6,8 @@ actions) live in room.py; this file only turns WebSocket messages into Room
 calls and Room errors into messages.
 
 Messages a browser sends (JSON objects):
-    {"type": "join",    "name": "Sam"}                       - must come first
+    {"type": "auth",    "code": "..."}                       - must come first
+    {"type": "join",    "name": "Sam"}                       - then this
     {"type": "ask",     "text": "What risks ...?"}
     {"type": "remove",  "question_id": "..."}               - from the queue
     {"type": "propose", "kind": "checklist|flag|memo", "question_id": "..."}
@@ -16,18 +17,28 @@ Messages the server sends:
     {"type": "state", "you": "<your member id>", "state": {...}}  - after every change
     {"type": "error", "message": "..."}                           - only to the sender
 
+Access code: with ROOM_ACCESS_CODE set, a socket that does not send the right
+code first is closed with 4401 (4429 after too many wrong codes from its IP),
+and HTTP data endpoints need `Authorization: Bearer <code>`. Without a code,
+auth is off - `dd serve` only allows that on loopback (check_startup).
+
 Start it with `dd serve`.
 """
 
 from __future__ import annotations
 
+import asyncio
+import hmac
+import ipaddress
 import json
+import time
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -35,6 +46,64 @@ from .config import PROJECT_ROOT
 from .room import Room
 
 WEB_DIST = PROJECT_ROOT / "web" / "dist"
+
+# A socket has this long to send its code before it is closed.
+AUTH_TIMEOUT = 10.0
+# More wrong codes than this from one IP within the window = locked out until
+# the oldest one is a window old. Only wrong codes count: a success, or a
+# connection that sent no code at all, never locks anyone out.
+MAX_FAILURES = 5
+FAILURE_WINDOW = 60.0
+CLOSE_BAD_CODE = 4401
+CLOSE_TOO_MANY = 4429
+
+
+def check_startup(host: str, code: str) -> str | None:
+    """Fail closed: a room reachable from other machines must have a code.
+    Raises ValueError if it would start open on the network; returns a warning
+    if auth is off on loopback; None if a code is set."""
+    if code.strip():
+        return None
+    if host == "localhost" or _is_loopback(host):
+        return f"ROOM_ACCESS_CODE is not set - auth is OFF. Fine only because {host} is this machine alone."
+    raise ValueError(
+        f"refusing to start on {host} without an access code: anyone who can reach this port "
+        "could join, vote and spend the Groq quota. Set ROOM_ACCESS_CODE in .env, "
+        "or use --host 127.0.0.1 for this machine only."
+    )
+
+
+def _is_loopback(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False  # any other host name: assume reachable
+
+
+def _code_matches(given: Any, code: str) -> bool:
+    # Bytes, because compare_digest refuses non-ASCII text.
+    return isinstance(given, str) and hmac.compare_digest(given.encode("utf-8"), code.encode("utf-8"))
+
+
+class FailedAttempts:
+    """Wrong codes per client IP, in memory. Forgotten on restart."""
+
+    def __init__(self) -> None:
+        self._times: dict[str, deque[float]] = {}
+
+    def blocked(self, ip: str) -> bool:
+        times = self._times.get(ip)
+        if times is None:
+            return False
+        while times and times[0] <= time.monotonic() - FAILURE_WINDOW:
+            times.popleft()
+        if not times:
+            del self._times[ip]
+            return False
+        return len(times) >= MAX_FAILURES
+
+    def record(self, ip: str) -> None:
+        self._times.setdefault(ip, deque()).append(time.monotonic())
 
 
 def _field(msg: dict[str, Any], key: str) -> str:
@@ -75,8 +144,53 @@ def _from_own_page(ws: WebSocket) -> bool:
     return origin is None or urlsplit(origin).netloc == ws.headers.get("host", "")
 
 
-def create_app(state_file: Path | None = None) -> FastAPI:
+def _client_ip(conn: WebSocket | Request) -> str:
+    return conn.client.host if conn.client else "unknown"
+
+
+async def _authenticate(ws: WebSocket, code: str, failures: FailedAttempts) -> bool:
+    """The first message must be {"type": "auth", "code": <the code>}. Until
+    then nothing is sent and nothing is handled. On failure the socket is
+    closed - with no reason text, so nothing about the code goes back."""
+    ip = _client_ip(ws)
+    if failures.blocked(ip):
+        await ws.close(code=CLOSE_TOO_MANY)
+        return False
+    try:
+        msg = json.loads(await asyncio.wait_for(ws.receive_text(), AUTH_TIMEOUT))
+    except WebSocketDisconnect:
+        return False
+    except (asyncio.TimeoutError, ValueError):
+        msg = None
+    given = msg.get("code") if isinstance(msg, dict) and msg.get("type") == "auth" else None
+    if _code_matches(given, code):
+        return True
+    if isinstance(given, str) and given:
+        failures.record(ip)  # a real guess; a missing code is not one
+    await ws.close(code=CLOSE_BAD_CODE)
+    return False
+
+
+def create_app(state_file: Path | None = None, access_code: str | None = None) -> FastAPI:
+    """access_code None or blank = auth off. `dd serve` passes ROOM_ACCESS_CODE
+    and decides, through check_startup, whether running without one is allowed."""
     room = Room(state_file=state_file)
+    code = access_code if access_code and access_code.strip() else None
+    failures = FailedAttempts()
+
+    def require_code(request: Request) -> None:
+        """For every HTTP endpoint that returns room or answer data."""
+        if not code:
+            return
+        ip = _client_ip(request)
+        if failures.blocked(ip):
+            raise HTTPException(429, "too many wrong access codes - wait a minute")
+        scheme, _, given = request.headers.get("authorization", "").partition(" ")
+        if scheme.lower() != "bearer" or not given:
+            raise HTTPException(401, "access code required", headers={"WWW-Authenticate": "Bearer"})
+        if not _code_matches(given, code):
+            failures.record(ip)
+            raise HTTPException(401, "wrong access code", headers={"WWW-Authenticate": "Bearer"})
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -88,7 +202,8 @@ def create_app(state_file: Path | None = None) -> FastAPI:
     app.state.room = room
 
     @app.get("/api/health")
-    async def health() -> dict[str, Any]:
+    async def health(request: Request) -> dict[str, Any]:
+        require_code(request)  # the member count is room data
         return {"status": room.status, "members": len(room.members)}
 
     @app.websocket("/ws")
@@ -97,6 +212,8 @@ def create_app(state_file: Path | None = None) -> FastAPI:
             await ws.close(code=1008)  # policy violation
             return
         await ws.accept()
+        if code and not await _authenticate(ws, code, failures):
+            return
         member_id: str | None = None
         try:
             while True:
@@ -105,7 +222,9 @@ def create_app(state_file: Path | None = None) -> FastAPI:
                     msg = json.loads(raw)
                     if not isinstance(msg, dict):
                         raise ValueError("a message must be a JSON object")
-                    if member_id is None:
+                    if msg.get("type") == "auth":
+                        pass  # already through (or auth is off): nothing to do
+                    elif member_id is None:
                         if msg.get("type") != "join":
                             raise ValueError("join with a name first")
                         member_id = await room.join(ws, _field(msg, "name"))

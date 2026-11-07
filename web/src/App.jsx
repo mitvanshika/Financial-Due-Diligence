@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import AccessCodeScreen from "./components/AccessCodeScreen.jsx";
 import ActionPanel from "./components/ActionPanel.jsx";
 import ActivityLog from "./components/ActivityLog.jsx";
 import AskBox from "./components/AskBox.jsx";
@@ -18,6 +19,10 @@ export default function App() {
     const timer = setTimeout(clearError, ERROR_SHOWN_MS);
     return () => clearTimeout(timer);
   }, [error, clearError]);
+
+  if (room.access) {
+    return <AccessCodeScreen problem={room.access} onSubmit={room.submitCode} />;
+  }
 
   const joined = Boolean(you && state && state.members.some((m) => m.id === you));
   if (!joined) {

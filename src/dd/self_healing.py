@@ -159,25 +159,41 @@ def grade_chunks(
         weak=f"{sh.give_up_below:g}",
     )
 
-    resp = get_groq_client(cfg).chat.completions.create(
-        model=cfg.generation.utility_model,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=cfg.generation.utility_max_tokens,
-        temperature=0.0,
-        # Same fix as rewrite_query: without it the model can spend its whole
-        # token budget thinking and return nothing.
-        reasoning_effort=cfg.generation.utility_effort,
-        response_format={
-            "type": "json_schema",
-            # strict: Groq guarantees the reply matches the schema. Without
-            # it, the reply can be invalid JSON.
-            "json_schema": {"name": "chunk_grades", "schema": _GRADE_SCHEMA, "strict": True},
-        },
-    )
+    def _ask(temperature: float):
+        return get_groq_client(cfg).chat.completions.create(
+            model=cfg.generation.utility_model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=cfg.generation.utility_max_tokens,
+            temperature=temperature,
+            # Same fix as rewrite_query: without it the model can spend its whole
+            # token budget thinking and return nothing.
+            reasoning_effort=cfg.generation.utility_effort,
+            response_format={
+                "type": "json_schema",
+                # strict: Groq guarantees the reply matches the schema. Without
+                # it, the reply can be invalid JSON.
+                "json_schema": {"name": "chunk_grades", "schema": _GRADE_SCHEMA, "strict": True},
+            },
+        )
+
+    # Groq sometimes rejects the call itself with 400 "json_validate_failed"
+    # (the model wrote broken JSON). At temperature 0 it repeats the same
+    # mistake, so the retry has to change something: one more try at 0.5.
+    # Any other error is real and still raises.
+    resp = None
+    for temperature in (0.0, 0.5):
+        try:
+            resp = _ask(temperature)
+            break
+        except Exception as exc:  # noqa: BLE001 - re-raised unless it is this one error
+            if "json_validate_failed" not in str(exc):
+                raise
 
     markers = [f"{i}" for i in range(len(chunks))] + [f"S{i}" for i in range(1, len(facts) + 1)]
     try:
-        reply = json.loads(resp.choices[0].message.content or "")["grades"]
+        # resp is None when both tries failed: json.loads("") then fails and
+        # every item is failed honestly below.
+        reply = json.loads((resp.choices[0].message.content if resp else "") or "")["grades"]
         # Match each grade to its item by the marker the model wrote, never by
         # position: the model can list correct grades in the wrong order, and
         # matching by position would then hand them to the wrong passages.

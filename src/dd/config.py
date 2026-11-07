@@ -36,6 +36,8 @@ class Secrets(BaseSettings):
     )
 
     groq_api_key: str = ""
+    # The team room's shared access code. Unset = the room only starts on loopback.
+    room_access_code: str = ""
     edgar_identity: str = ""
     qdrant_mode: Literal["embedded", "server"] = "embedded"
     qdrant_path: str = "data/qdrant"
