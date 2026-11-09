@@ -122,7 +122,14 @@ Honest limits:
 python -m pytest -q
 python eval/run_eval.py [types] [--repeat N]
 python eval/compare_runs.py old.jsonl new.jsonl "words from the question"
+python eval/run_eval.py --summarize eval/results_old.jsonl   # summary only, no model calls
 ```
+
+Free-text answers are graded by hand in `eval/review.md`: type correct /
+partly / wrong / refused after each **Verdict:**. The next run, or
+`--summarize`, saves the verdicts to `eval/hand_grades.json` before rewriting
+`review.md`, and fills them back in for any answer with the same text.
+`compare_runs.py` shows each answer's confidence notes and retrieval attempts.
 
 Rename the old `eval/results.jsonl` before a new run. The eval refuses to mix
 results from different code.
