@@ -58,14 +58,16 @@ class FakeGroq:
 
     def __init__(self, fact_grades: dict[str, float] | None = None,
                  answer: dict | list[dict] | None = None, fail: str | None = None,
-                 unreadable_grades: bool = False, shuffle_grades: bool = False,
+                 unreadable_grades: bool | int = False, shuffle_grades: bool = False,
                  parts: list[str] | None = None) -> None:
         self.fact_grades = fact_grades or {}
         # A list is replied in turn, one per answer call.
         self.answer = answer or {"answerable": True, "answer": "Tariffs could hurt margins [1].", "citations": ["[1]"]}
         self.parts = parts or []  # what splitting the question returns
         self.fail = fail
+        # True: every grading reply is unreadable; a number: only the first N.
         self.unreadable_grades = unreadable_grades
+        self.grade_calls = 0
         self.shuffle_grades = shuffle_grades  # list grades in reverse order, as a real model sometimes does
         self.rewrites = 0
         self.prompts: dict[str, list[str]] = {}  # call kind -> prompts sent, in order
@@ -82,7 +84,9 @@ class FakeGroq:
                       for marker, item in self._items(kwargs["messages"][0]["content"])]
             if self.shuffle_grades:
                 grades.reverse()
-            content = "not json at all" if self.unreadable_grades else json.dumps({"grades": grades})
+            self.grade_calls += 1
+            unreadable = self.unreadable_grades is True or self.grade_calls <= int(self.unreadable_grades)
+            content = "not json at all" if unreadable else json.dumps({"grades": grades})
         elif kind == "grounded_answer":
             content = json.dumps(self.answer.pop(0) if isinstance(self.answer, list) else self.answer)
         elif kind == "question_parts":
@@ -249,6 +253,39 @@ def test_an_unreadable_grader_reply_refuses_instead_of_crashing(world):
     outcome = sh.self_heal("question?")
     assert not outcome.succeeded
     assert all(g.relevance == 0.0 for g in outcome.chunks)
+
+
+def test_a_failed_grading_is_graded_again_not_given_up_on(world):
+    """Q8, eval of 9 Nov: "How much cash did Apple generate from operating
+    activities?" had its database figure and 6 passages, yet every item came
+    back 0 and the early give-up refused it after 1 attempt. A grading call
+    that fails twice says nothing about the evidence: the next attempt grades
+    the same question - and its figure - again, instead of giving up."""
+    groq = FakeGroq(fact_grades={"Net cash from operating activities": 1.0}, unreadable_grades=2)
+    world([passages("a1", 0.1, 0.1)],
+          facts=[fact("Net cash from operating activities", 111_482e6, "cash_flow")], groq=groq)
+    events = []
+    outcome = sh.self_heal("operating cash flow FY2025?", on_progress=lambda s, d: events.append((s, d)))
+
+    assert outcome.succeeded and len(outcome.attempts) == 2
+    assert [f["label"] for f in outcome.structured_facts] == ["Net cash from operating activities"]
+    first, second = outcome.attempts
+    assert "couldn't be read" in first.note
+    assert (second.strategy, second.query) == ("regrade", "operating cash flow FY2025?")
+    assert second.note == "1 of 1 database facts relevant"
+    assert groq.rewrites == 0 and "give_up" not in stages(events)
+    assert stages(events).count("grader_failed") == 1
+    assert dict(events)["graded"]["facts_total"] == 1, "facts reported on the attempt that graded them"
+
+
+def test_a_regraded_question_can_still_give_up_early(world):
+    """After a failed grading, the give-up shortcut applies to the regrade:
+    that is the first real grading of the original question."""
+    world([passages("a1", 0.05, 0.1)], groq=FakeGroq(unreadable_grades=2))
+    events = []
+    outcome = sh.self_heal("FY2027 projections?", on_progress=lambda s, d: events.append((s, d)))
+    assert not outcome.succeeded and len(outcome.attempts) == 2
+    assert stages(events)[-1] == "give_up"
 
 
 # --- Layers 4 + 5 together (answer) ----------------------------------------------

@@ -121,6 +121,30 @@ def _clamp(x: object) -> float:
         return 0.0
 
 
+# The reason every item gets when the grader's reply can't be used. self_heal()
+# looks for it: a failed grading call says nothing about the evidence, so it
+# must not end the search as "nothing relevant".
+GRADER_FAILED = "grader failed"
+
+
+def _read_grades(resp, markers: list[str]) -> dict[str, dict]:
+    """{marker: grade} from the grader's reply; {} when the reply is empty,
+    isn't JSON, or grades none of the items."""
+    try:
+        reply = json.loads((resp.choices[0].message.content if resp else "") or "")["grades"]
+        # Match each grade to its item by the marker the model wrote, never by
+        # position: the model can list correct grades in the wrong order, and
+        # matching by position would then hand them to the wrong passages.
+        by_marker: dict[str, dict] = {}
+        for g in reply:
+            m = _marker(g.get("item"))
+            if m in markers and m not in by_marker:
+                by_marker[m] = {"relevance": _clamp(g.get("relevance")), "reason": str(g.get("reason", ""))}
+        return by_marker
+    except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
+        return {}
+
+
 def _marker(item: object) -> str:
     """The marker a grade names: "[0]" -> "0", "[S1]" / "s1" -> "S1".
     Anything unrecognisable -> "" (matches no item)."""
@@ -193,36 +217,27 @@ def grade_chunks(
             },
         )
 
-    # Groq sometimes rejects the call itself with 400 "json_validate_failed"
-    # (the model wrote broken JSON). At temperature 0 it repeats the same
-    # mistake, so the retry has to change something: one more try at 0.5.
-    # Any other error is real and still raises.
-    resp = None
+    # A reply can be unusable two ways: Groq rejects the call with 400
+    # "json_validate_failed" (the model wrote broken JSON), or the reply
+    # arrives but is empty, isn't JSON, or grades none of the items. Either
+    # way one more try, at 0.5: at temperature 0 the model repeats the same
+    # mistake. Any other error is real and still raises.
+    markers = [f"{i}" for i in range(len(chunks))] + [f"S{i}" for i in range(1, len(facts) + 1)]
+    by_marker: dict[str, dict] = {}
     for temperature in (0.0, 0.5):
         try:
             resp = _ask(temperature)
-            break
         except Exception as exc:  # noqa: BLE001 - re-raised unless it is this one error
             if "json_validate_failed" not in str(exc):
                 raise
-
-    markers = [f"{i}" for i in range(len(chunks))] + [f"S{i}" for i in range(1, len(facts) + 1)]
-    try:
-        # resp is None when both tries failed: json.loads("") then fails and
-        # every item is failed honestly below.
-        reply = json.loads((resp.choices[0].message.content if resp else "") or "")["grades"]
-        # Match each grade to its item by the marker the model wrote, never by
-        # position: the model can list correct grades in the wrong order, and
-        # matching by position would then hand them to the wrong passages.
-        by_marker: dict[str, dict] = {}
-        for g in reply:
-            m = _marker(g.get("item"))
-            if m in markers and m not in by_marker:
-                by_marker[m] = {"relevance": _clamp(g.get("relevance")), "reason": str(g.get("reason", ""))}
-    except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
-        # Unreadable reply: fail every item rather than crash. The question
-        # is then refused honestly ("0 relevant") instead of erroring out.
-        by_marker = {m: {"relevance": 0.0, "reason": "grader failed"} for m in markers}
+            continue
+        by_marker = _read_grades(resp, markers)
+        if by_marker:
+            break
+    if not by_marker:
+        # Both tries unusable: fail every item rather than crash. self_heal()
+        # sees GRADER_FAILED and grades again on its next attempt.
+        by_marker = {m: {"relevance": 0.0, "reason": GRADER_FAILED} for m in markers}
 
     # An item the model skipped fails rather than borrowing a guess - a wrong
     # guess here silently corrupts the scores. If it graded one twice, the
@@ -339,14 +354,22 @@ def self_heal(
     prev_chunk_ids: set[str] | None = None
     graded: list[GradedChunk] = []
     best: tuple[int, float, list[GradedChunk], str] | None = None  # (n_relevant, mean, chunks, query)
+    facts_graded = False
+    strategy = "original"
 
     for attempt_num in range(1, sh.max_attempts + 1):
         emit(on_progress, "search", attempt=attempt_num, query=current_query)
         retrieved = hybrid_retrieve(current_query, conf)
-        emit(on_progress, "grade", attempt=attempt_num, passages=len(retrieved),
-             facts=len(clean_facts) if attempt_num == 1 else 0)
-        if attempt_num == 1:
-            graded, fact_scores = grade_chunks(current_query, retrieved, conf, clean_facts)
+        # Facts are graded once: on attempt 1, or - if the grader's reply on
+        # attempt 1 couldn't be read - on the next one. That one still asks
+        # the original question (a failed grading is never reworded).
+        to_grade = [] if facts_graded else clean_facts
+        emit(on_progress, "grade", attempt=attempt_num, passages=len(retrieved), facts=len(to_grade))
+        graded, scores_now = grade_chunks(current_query, retrieved, conf, to_grade)
+        grader_failed = bool(graded) and all(g.reason == GRADER_FAILED for g in graded)
+        if to_grade and not grader_failed:
+            facts_graded = True
+            fact_scores = scores_now
             # A fact that doesn't answer the question isn't passed on: iPhone
             # revenue graded low for "iPhone units" never reaches Layer 5.
             relevant_facts = [
@@ -354,8 +377,6 @@ def self_heal(
                 for f, s in zip(clean_facts, fact_scores)
                 if s >= sh.relevance_threshold
             ]
-        else:
-            graded, _ = grade_chunks(current_query, retrieved, conf)
 
         chunk_ids = {g.retrieved.chunk.chunk_id for g in graded}
         n_relevant_chunks = sum(1 for g in graded if g.relevance >= sh.relevance_threshold)
@@ -364,31 +385,35 @@ def self_heal(
         mean_relevance = sum(g.relevance for g in graded) / len(graded) if graded else 0.0
 
         stagnated = (
-            prev_chunk_ids is not None
+            not grader_failed
+            and prev_chunk_ids is not None
             and _jaccard(chunk_ids, prev_chunk_ids) >= sh.stagnation_jaccard
         )
 
+        if grader_failed:
+            note = "the grader's reply couldn't be read twice, so nothing was graded"
+        elif clean_facts:
+            note = f"{len(relevant_facts)} of {len(clean_facts)} database facts relevant"
+        else:
+            note = ""
         attempts.append(
             AttemptRecord(
                 attempt=attempt_num,
                 query=current_query,
-                strategy="original" if attempt_num == 1 else "rewrite",
+                strategy=strategy,
                 n_retrieved=len(retrieved),
                 n_relevant=n_relevant_chunks,
                 mean_relevance=mean_relevance,
                 chunk_ids=sorted(chunk_ids),
                 stagnated=stagnated,
-                note=(
-                    f"{len(relevant_facts)} of {len(clean_facts)} database facts relevant"
-                    if clean_facts else ""
-                ),
+                note=note,
             )
         )
         emit(
             on_progress, "graded", attempt=attempt_num, relevant=n_relevant_chunks, total=len(graded),
-            # Facts are only graded on attempt 1; report them there.
-            facts_relevant=len(relevant_facts) if attempt_num == 1 else None,
-            facts_total=len(clean_facts) if attempt_num == 1 else None,
+            # Report facts on the attempt that graded them.
+            facts_relevant=len(relevant_facts) if to_grade and not grader_failed else None,
+            facts_total=len(clean_facts) if to_grade and not grader_failed else None,
         )
 
         if best is None or (n_relevant_chunks, mean_relevance) > best[:2]:
@@ -411,6 +436,14 @@ def self_heal(
                 relevance_threshold=sh.relevance_threshold,
             )
 
+        # A failed grading call says nothing about the evidence: don't give up
+        # on it, and don't reword the question (there are no grades to reword
+        # from). Spend the next attempt grading the same question again.
+        if grader_failed:
+            emit(on_progress, "grader_failed", attempt=attempt_num)
+            strategy = "regrade"
+            continue
+
         if stagnated:
             emit(on_progress, "stagnated", attempt=attempt_num)
             break  # rewriting again would just burn the remaining attempts for nothing
@@ -418,13 +451,16 @@ def self_heal(
         # Nothing on the first try even comes close: the filing almost
         # certainly doesn't cover this, and rewording rarely rescues it.
         # Saves two rewrites (~40 s) on questions that end in a refusal anyway.
-        if attempt_num == 1 and max(scores + fact_scores, default=0.0) < sh.give_up_below:
+        # "First try" is the first attempt that actually graded the original
+        # question - attempt 2 if attempt 1's grading failed.
+        if strategy != "rewrite" and max(scores + fact_scores, default=0.0) < sh.give_up_below:
             emit(on_progress, "give_up", best=round(max(scores + fact_scores, default=0.0), 2),
                  below=sh.give_up_below)
             break
 
         prev_chunk_ids = chunk_ids
         if attempt_num < sh.max_attempts:
+            strategy = "rewrite"
             current_query = rewrite_query(query, current_query, graded, conf)
             emit(on_progress, "rewrite", attempt=attempt_num + 1, query=current_query)
 

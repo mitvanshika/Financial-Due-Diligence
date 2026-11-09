@@ -83,7 +83,7 @@ class AttemptRecord(BaseModel):
 
     attempt: int
     query: str
-    strategy: str                 # "original" | "rewrite" | "decompose"
+    strategy: str                 # "original" | "rewrite" | "regrade" | "decompose"
     n_retrieved: int
     n_relevant: int
     mean_relevance: float
