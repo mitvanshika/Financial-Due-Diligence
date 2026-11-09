@@ -5,7 +5,7 @@ confidence band, and the system refuses when the filing does not contain the
 answer. Answers can become approved actions (checklist item, review flag, risk
 memo), and a team can work together in a shared web room.
 
-Built by Vanshika Mittal and Samarth (samarth6).
+Built by Vanshika Mittal and Samarth.
 
 ## What makes it different
 
