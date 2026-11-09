@@ -465,9 +465,28 @@ def _confidence(
     # Every number must match something the answer cites. If one doesn't,
     # the answer is still shown, but marked LOW - never quietly trusted.
     bad = _unverified_numbers(answer_text, cited)
+    # Unless the number is a database figure the model was given and didn't
+    # cite: right number, wrong citation ("$7.46 per share [3]", where [3] is
+    # the share-count piece of the income statement and [S1] is 7.46). Still
+    # not HIGH - whoever opens [3] won't find it - but not LOW: it isn't wrong.
+    cited_markers = [c.marker for c in citations]
+    uncited = {m: e for m, e in lookup.items() if isinstance(e, dict) and m not in cited_markers}
+    miscited = {}
+    for written in bad if uncited else []:
+        if not _unverified_numbers(written, cited + list(uncited.values())):
+            # Name the one figure it is, if it's one; a sum or change of
+            # several just "follows from" the figures given.
+            alone = [m for m, f in uncited.items() if not _unverified_numbers(written, [f])]
+            miscited[written] = alone[0] if alone else "".join(uncited)
+    bad = [b for b in bad if b not in miscited]
     if bad:
         score = min(score, bands.medium - 0.01)
         notes.append(f"number(s) not found in cited sources: {', '.join(bad)}")
+    if miscited:
+        score = min(score, bands.high - 0.01)
+        where = "".join(cited_markers) or "nothing"
+        for written, marker in miscited.items():
+            notes.append(f"{written} matches database figure {marker}, but is cited to {where}, which doesn't state it")
 
     if len(outcome.attempts) > 1:
         notes.append(f"needed {len(outcome.attempts)} retrieval attempts")

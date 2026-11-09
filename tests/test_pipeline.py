@@ -666,6 +666,38 @@ def test_an_answer_citing_the_table_is_capped_only_when_its_numbers_miss_the_fig
     assert a.confidence.band == ("medium" if capped else "high")
 
 
+# The income statement is split in two pieces; the second has the share counts
+# ("Diluted | 15,004,697") but not the EPS row. The answer takes 7.46 from [S1]
+# and cites this piece: right number, wrong citation. MEDIUM, not LOW - and
+# never HIGH, even when the passage was found strongly.
+SHARES_PIECE = "\n".join([
+    "CONSOLIDATED STATEMENTS OF OPERATIONS (in thousands of shares) | 2025 | 2024 grade=0.9",
+    "Shares used in computing earnings per share:",
+    "Diluted | 15,004,697 | 15,408,095",
+])
+
+
+@pytest.mark.parametrize("answer, band, wrong", [
+    ("Diluted EPS was $7.46 per share [1].", "medium", []),  # miscited, right number
+    ("Diluted EPS was $6.08 per share [1].", "low", ["$6.08"]),  # FY2024's, in neither source
+    ("Diluted EPS was $7.46, basic $9.99 per share [1].", "low", ["$9.99"]),  # one right, one made up
+])
+def test_a_right_number_cited_to_the_wrong_passage_is_medium_not_low(world, answer, band, wrong):
+    p = passages("a1", 0.9)
+    p[0].chunk.text = SHARES_PIECE
+    p[0].vector_rank, p[0].bm25_rank, p[0].rerank_score = 1, 1, 0.99
+    eps = {**fact("Diluted (in dollars per share)", 7.46), "label": "Diluted (in dollars per share)"}
+    world([p], facts=[eps],
+          groq=FakeGroq(fact_grades={"Diluted (in dollars per share)": 0.9},
+                        answer={"answerable": True, "citations": ["[1]"], "answer": answer}))
+    a = gen.answer("What was Apple's diluted EPS for FY2025?")
+    assert a.confidence.band == band
+    notes = a.confidence.notes
+    assert any("$7.46 matches database figure [S1], but is cited to [1]" in n for n in notes) is ("$7.46" in answer)
+    assert [n for n in notes if n.startswith("number(s) not found")] == (
+        [f"number(s) not found in cited sources: {', '.join(wrong)}"] if wrong else [])
+
+
 # --- a second search when the answer step finds nothing answers it ---------------
 # Eval Q20: "what caused the FY2024 net income dip?" finds the net income lines;
 # the answer step rightly refuses; the cause (a tax charge) sits where the
