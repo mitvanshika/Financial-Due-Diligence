@@ -436,11 +436,17 @@ def _confidence(
     else:
         score = w.hybrid_agreement * hybrid + w.rerank_strength * rerank + w.loop_cleanliness * loop
 
-    # Facts were handed over, but the answer cites none of them: it took its
-    # numbers from prose instead, or gave none. Capped at medium.
-    if _clean_facts(outcome) and not cited_facts:
-        score = min(score, bands.high - 0.01)
-        notes.append("answer ignored the database figures it was given")
+    # Facts were handed over, but the answer cites none of them and states
+    # numbers that match none of them: it took its figures from elsewhere, such
+    # as a table's other-year column. Capped at medium. Not capped when it
+    # cites a table with the same value ("$73,733 million [1]") or gives a
+    # reason with no number ("why did Services grow"): nothing was ignored.
+    facts_given = _clean_facts(outcome)
+    if facts_given and not cited_facts:
+        stated = {written for _, _, written in _numbers(answer_text)}
+        if stated and stated <= set(_unverified_numbers(answer_text, facts_given)):
+            score = min(score, bands.high - 0.01)
+            notes.append("answer's numbers match none of the database figures it was given")
 
     # The question names a product or region, but the answer rests on
     # company-wide figures alone: right if the total is what was wanted

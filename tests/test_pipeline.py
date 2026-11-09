@@ -637,6 +637,35 @@ def test_a_passage_that_adds_a_reason_is_blended_in(world):
     assert any("1 cited passage(s) carry part of the answer" in n for n in a.confidence.notes)
 
 
+# Limitations 5.8 and 5.3: the answer was given a database figure but cites the
+# table instead, or gives a reason with no number. Neither ignored the figure.
+# Only numbers that match none of the figures (another year's column) are capped.
+EQUITY_TABLE = "\n".join([
+    "CONSOLIDATED BALANCE SHEETS (in millions) | 2025 | 2024 grade=0.9",
+    "Total shareholders' equity | 73,733 | 56,950",
+])
+
+
+@pytest.mark.parametrize("answer, capped", [
+    ("Total shareholders' equity was $73,733 million [1].", False),  # 5.8: same value, from the table
+    ("Equity rose by $16,783 million to $73,733 million [1].", False),  # also a figure the table supports
+    ("Equity grew because the accumulated deficit shrank [1].", False),  # 5.3: a reason, no number
+    ("Total shareholders' equity was $56,950 million [1].", True),  # FY2024's column, read as FY2025
+])
+def test_an_answer_citing_the_table_is_capped_only_when_its_numbers_miss_the_figures(world, answer, capped):
+    p = passages("a1", 0.9)
+    p[0].chunk.text = EQUITY_TABLE
+    p[0].vector_rank, p[0].bm25_rank, p[0].rerank_score = 1, 1, 0.99  # a strong passage on its own
+    equity = fact("Total shareholders' equity", 73_733e6, table="balance_sheet")
+    world([p], facts=[equity],
+          groq=FakeGroq(fact_grades={"Total shareholders' equity": 0.9},
+                        answer={"answerable": True, "citations": ["[1]"], "answer": answer}))
+    a = gen.answer("What was Apple's total shareholders' equity in FY2025?")
+    noted = any("match none of the database figures" in n for n in a.confidence.notes)
+    assert noted is capped
+    assert a.confidence.band == ("medium" if capped else "high")
+
+
 # --- a second search when the answer step finds nothing answers it ---------------
 # Eval Q20: "what caused the FY2024 net income dip?" finds the net income lines;
 # the answer step rightly refuses; the cause (a tax charge) sits where the
