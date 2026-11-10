@@ -5,6 +5,14 @@ const PROBLEMS = {
   "too-many": "Too many wrong codes from this network. Wait a minute, then try again.",
 };
 
+function Logo() {
+  return (
+    <div className="logo" aria-hidden="true">
+      <span /><span /><span />
+    </div>
+  );
+}
+
 export default function AccessCodeScreen({ problem, onSubmit }) {
   const [code, setCode] = useState("");
 
@@ -14,11 +22,13 @@ export default function AccessCodeScreen({ problem, onSubmit }) {
   }
 
   return (
-    <div className="join">
-      <h1>Due-Diligence Room</h1>
-      <p className="muted">Enter access code</p>
-      {PROBLEMS[problem] && <p className="error-text">{PROBLEMS[problem]}</p>}
-      <form onSubmit={submit}>
+    <div className="auth">
+      <div className="blob b1" /><div className="blob b2" /><div className="blob b3" />
+      <form className={problem ? "auth-card shake" : "auth-card"} onSubmit={submit}>
+        <Logo />
+        <h1>Due-Diligence Room</h1>
+        <p className="auth-sub">Enter the access code to continue</p>
+        {PROBLEMS[problem] && <p className="auth-error" role="alert">{PROBLEMS[problem]}</p>}
         <input
           autoFocus
           type="password"
@@ -27,8 +37,8 @@ export default function AccessCodeScreen({ problem, onSubmit }) {
           value={code}
           onChange={(e) => setCode(e.target.value)}
         />
-        <button type="submit" disabled={!code.trim()}>
-          Enter
+        <button type="submit" className="auth-button" disabled={!code.trim()}>
+          Enter <span className="arrow-slide">&rarr;</span>
         </button>
       </form>
     </div>
