@@ -31,7 +31,7 @@ from .models import (
     GradedChunk,
     RetrievalOutcome,
 )
-from .self_healing import ProgressFn, emit, get_groq_client, self_heal
+from .self_healing import ProgressFn, emit, get_groq_client, search_parts, self_heal
 from .structured import SEGMENT_LABELS, describe_fact, segments_mentioned
 
 # --- Step 1: lay out the evidence with markers -----------------------------
@@ -276,14 +276,24 @@ def _allowed_values(cited: list[GradedChunk | dict]) -> tuple[list[float], list[
     for g in cited:
         if isinstance(g, dict):
             continue
-        for m in re.finditer(r"(\d[\d,]*(?:\.\d+)?)(\s*(?:million|billion))?", g.retrieved.chunk.text, re.IGNORECASE):
-            digits = m.group(1).rstrip(",.")
-            numbers.append(float(digits.replace(",", "")))
-            if "." in digits and not m.group(2):
-                cents.append(numbers[-1])
+        for line in g.retrieved.chunk.text.split("\n"):
+            row = []
+            for m in re.finditer(r"(\d[\d,]*(?:\.\d+)?)(\s*(?:million|billion))?", line, re.IGNORECASE):
+                digits = m.group(1).rstrip(",.")
+                row.append(float(digits.replace(",", "")))
+                if "." in digits and not m.group(2):
+                    cents.append(row[-1])
+            numbers += row
+            # % change between two numbers in the same row: "diluted EPS rose
+            # 22.7%" is $6.08 to $7.46 on one line of the EPS table. Only within
+            # a row - across a whole passage, almost any percentage would match.
+            for a, b in itertools.permutations(row, 2):
+                if a:
+                    cells.append(abs(b - a) / abs(a) * 100)
     for v in _with_pairs(numbers):
         cells.append(v)
-        dollars += [v * 1e6, v * 1e9]
+        # Share counts are tabled "in thousands", amounts "in millions".
+        dollars += [v * 1e3, v * 1e6, v * 1e9]
     dollars += _with_pairs(cents)
     return dollars, cells
 
@@ -426,11 +436,17 @@ def _confidence(
     else:
         score = w.hybrid_agreement * hybrid + w.rerank_strength * rerank + w.loop_cleanliness * loop
 
-    # Facts were handed over, but the answer cites none of them: it took its
-    # numbers from prose instead, or gave none. Capped at medium.
-    if _clean_facts(outcome) and not cited_facts:
-        score = min(score, bands.high - 0.01)
-        notes.append("answer ignored the database figures it was given")
+    # Facts were handed over, but the answer cites none of them and states
+    # numbers that match none of them: it took its figures from elsewhere, such
+    # as a table's other-year column. Capped at medium. Not capped when it
+    # cites a table with the same value ("$73,733 million [1]") or gives a
+    # reason with no number ("why did Services grow"): nothing was ignored.
+    facts_given = _clean_facts(outcome)
+    if facts_given and not cited_facts:
+        stated = {written for _, _, written in _numbers(answer_text)}
+        if stated and stated <= set(_unverified_numbers(answer_text, facts_given)):
+            score = min(score, bands.high - 0.01)
+            notes.append("answer's numbers match none of the database figures it was given")
 
     # The question names a product or region, but the answer rests on
     # company-wide figures alone: right if the total is what was wanted
@@ -449,9 +465,28 @@ def _confidence(
     # Every number must match something the answer cites. If one doesn't,
     # the answer is still shown, but marked LOW - never quietly trusted.
     bad = _unverified_numbers(answer_text, cited)
+    # Unless the number is a database figure the model was given and didn't
+    # cite: right number, wrong citation ("$7.46 per share [3]", where [3] is
+    # the share-count piece of the income statement and [S1] is 7.46). Still
+    # not HIGH - whoever opens [3] won't find it - but not LOW: it isn't wrong.
+    cited_markers = [c.marker for c in citations]
+    uncited = {m: e for m, e in lookup.items() if isinstance(e, dict) and m not in cited_markers}
+    miscited = {}
+    for written in bad if uncited else []:
+        if not _unverified_numbers(written, cited + list(uncited.values())):
+            # Name the one figure it is, if it's one; a sum or change of
+            # several just "follows from" the figures given.
+            alone = [m for m, f in uncited.items() if not _unverified_numbers(written, [f])]
+            miscited[written] = alone[0] if alone else "".join(uncited)
+    bad = [b for b in bad if b not in miscited]
     if bad:
         score = min(score, bands.medium - 0.01)
         notes.append(f"number(s) not found in cited sources: {', '.join(bad)}")
+    if miscited:
+        score = min(score, bands.high - 0.01)
+        where = "".join(cited_markers) or "nothing"
+        for written, marker in miscited.items():
+            notes.append(f"{written} matches database figure {marker}, but is cited to {where}, which doesn't state it")
 
     if len(outcome.attempts) > 1:
         notes.append(f"needed {len(outcome.attempts)} retrieval attempts")
@@ -506,7 +541,7 @@ def generate_answer(
 
     # Refusal 2: the evidence is on-topic but doesn't answer what was asked.
     if not result["answerable"]:
-        return Answer(query=query, answered=False, text=result["answer"], outcome=outcome)
+        return Answer(query=query, answered=False, text=result["answer"], outcome=outcome, refused_by_model=True)
 
     # Check markers from both places: inline in the text, and the required
     # "citations" list. Wrap bare "S1" as "[S1]" in case the model drops the
@@ -570,5 +605,22 @@ def answer(query: str, cfg: Config | None = None, on_progress: ProgressFn | None
         result = _model_failed(query, exc)
     else:
         result = generate_answer(outcome, conf, on_progress)
+        # No answer from the question's own words - whether Layer 4 refused the
+        # evidence or the answer model found it doesn't answer the question:
+        # one more search, with the question split into parts. Both happen to
+        # eval Q20 on different runs, depending on how the grader scores the
+        # net income lines. A failed model call has nothing to gain from it.
+        if result.refused_by_model or not outcome.succeeded:
+            try:
+                retried = search_parts(outcome, conf, on_progress)
+            except Exception:  # noqa: BLE001 - the extra search is an extra try; keep the refusal
+                retried = None
+            if retried is not None and retried.succeeded:
+                result = generate_answer(retried, conf, on_progress)
+                if result.confidence is not None:
+                    result.confidence.notes.append(
+                        "found on a second search: the first evidence didn't answer the question, so it was "
+                        f"split into parts ({retried.final_query})"
+                    )
     result.elapsed_s = round(time.perf_counter() - start, 2)
     return result

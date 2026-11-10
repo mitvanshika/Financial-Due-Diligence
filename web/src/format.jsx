@@ -16,15 +16,19 @@ export function stepLabel({ stage, details }) {
         : `Grading ${d.passages} passages for relevance`;
     case "graded": {
       const passages = `Attempt ${d.attempt}: ${d.relevant} of ${d.total} passages relevant`;
-      // Figures are graded once, on attempt 1 (facts_total is null after that).
+      // Figures are graded once (facts_total is null on the other attempts).
       return d.facts_total
         ? `${passages}; ${d.facts_relevant} of ${d.facts_total} figure(s) judged relevant`
         : passages;
     }
     case "rewrite":
       return `Weak results - rewording the question (attempt ${d.attempt}): "${d.query}"`;
+    case "grader_failed":
+      return `Couldn't read the relevance grades (attempt ${d.attempt}) - grading again`;
     case "stagnated":
       return `Rewording found the same passages again (attempt ${d.attempt}) - stopping`;
+    case "split":
+      return `The evidence didn't answer it - searching again in ${d.parts?.length} parts: ${(d.parts || []).map((p) => `"${p}"`).join(", ")}`;
     case "give_up":
       return `Nothing scored above ${d.below} (best ${d.best}) - the filing likely doesn't cover this; stopping early`;
     case "write":
